@@ -37,11 +37,34 @@ class BacktestEngine:
         self.equity_curve = []
         self.ai_memories = []
         # Tunable parameters (adjust to your preference)
-        self.min_confidence = 0.60      # lower threshold -> more entries
+        self.min_confidence = 0.55      # lower threshold -> more entries
         self.risk_per_trade = 0.03      # increase risk per trade (3%)
         self.crypto_max_lots = 0.5      # allow larger crypto position sizes
         self.forex_max_lots = 0.1       # allow larger forex/metals sizes
+        self.use_time_filter = True     # Enable ICT Silver Bullet time restriction
+
+    def _is_silver_bullet_time(self, timestamp: datetime) -> bool:
+        """
+        Check if time is within ICT Silver Bullet windows (EST based).
+        Windows: 3-4 AM (London), 10-11 AM (NY AM), 2-3 PM (NY PM).
+        """
+        # Convert to EST (Assuming input is UTC or Server time, adjust accordingly)
+        # For simplicity, we'll assume the data timestamp is aligned or we check hours directly.
+        # If data is UTC, London 3 AM is 8 AM UTC. NY 10 AM is 3 PM UTC.
         
+        # Using raw hours (assuming data is in NY time or adjusting for it):
+        h = timestamp.hour
+        m = timestamp.minute
+        
+        # Silver Bullet Hours (Strict 1 hour windows)
+        # 03:00 - 04:00
+        # 10:00 - 11:00
+        # 14:00 - 15:00
+        if h in [3, 10, 14]:
+            return True
+            
+        return False
+
     def get_historical_data(self, symbol: str, start_date: datetime, end_date: datetime, timeframe: str = "M5") -> pd.DataFrame:
         """Get historical data from MT5"""
         try:
@@ -114,6 +137,21 @@ class BacktestEngine:
             if index < 50:  # Need enough data
                 return {'signal': 'HOLD', 'confidence': 0.0}
             
+            # ICT TIME FILTER (Silver Bullet)
+            # ICT TIME FILTER (Silver Bullet)
+            current_time = df.index[index]
+            # Ensure it is a datetime object
+            if not isinstance(current_time, datetime):
+                 # Try to convert if it's a pandas Timestamp
+                 try: 
+                    current_time = current_time.to_pydatetime()
+                 except: 
+                    pass
+
+            if self.use_time_filter and not self._is_silver_bullet_time(current_time):
+                # logger.debug(f"Skipped {current_time} - Not SB hour ({current_time.hour})")
+                return {'signal': 'HOLD', 'confidence': 0.0, 'reason': f'Outside Silver Bullet Hours ({current_time.hour})'}
+            
             # Get market structure analysis
             market_bias = self._determine_market_bias(df, index)
             if market_bias == 'NEUTRAL':
@@ -167,7 +205,7 @@ class BacktestEngine:
                 if ote_level['valid']:
                     bullish_conditions += 0.5  # Bonus for OTE
                 
-                if bullish_conditions >= 2.0:  # Need at least 2 main conditions
+                if bullish_conditions >= 1.5:  # Relaxed to 1.5 for better capture
                     confidence = self._calculate_confluence_score(signal_strengths)
                     
                     # Determine stop loss
@@ -199,7 +237,7 @@ class BacktestEngine:
                 if ote_level['valid']:
                     bearish_conditions += 0.5  # Bonus for OTE
                 
-                if bearish_conditions >= 2.0:  # Need at least 2 main conditions
+                if bearish_conditions >= 1.5:  # Relaxed to 1.5 for better capture
                     confidence = self._calculate_confluence_score(signal_strengths)
                     
                     # Determine stop loss
@@ -241,12 +279,19 @@ class BacktestEngine:
             recent_high = highs.max()
             recent_low = lows.min()
             
-            if current_price > recent_high * 0.9995:  # More sensitive for M5
+            if current_price > recent_high:
                 return 'BULLISH'
-            elif current_price < recent_low * 1.0005:  # More sensitive for M5
+            elif current_price < recent_low:
                 return 'BEARISH'
+            
+            # If in range, check which side we are closer to
+            dist_to_high = recent_high - current_price
+            dist_to_low = current_price - recent_low
+            
+            if dist_to_high < dist_to_low:
+                return 'BULLISH'
             else:
-                return 'NEUTRAL'
+                return 'BEARISH'
                 
         except Exception:
             return 'NEUTRAL'
@@ -282,6 +327,14 @@ class BacktestEngine:
                     'swept_level': swing_high,
                     'strength': 0.8
                 }
+            
+            # Look back a few bars for a recent sweep if current bar didn't sweep
+            for j in range(1, 6):
+                prev_bar = df.iloc[index-j]
+                if prev_bar['low'] < swing_low and current['close'] > swing_low:
+                    return {'detected': True, 'type': 'BELOW_LOW', 'swept_level': swing_low, 'strength': 0.7}
+                if prev_bar['high'] > swing_high and current['close'] < swing_high:
+                    return {'detected': True, 'type': 'ABOVE_HIGH', 'swept_level': swing_high, 'strength': 0.7}
             
             return {'detected': False}
             
@@ -492,6 +545,9 @@ class BacktestEngine:
                 return {'error': 'No historical data available'}
             
             logger.info(f"📊 Loaded {len(data)} bars of data")
+            unique_hours = sorted(data.index.hour.unique())
+            logger.info(f"⏰ Unique hours in data: {unique_hours}")
+            logger.info(f"🎯 Target Silver Bullet Hours: [3, 10, 14]")
             
             # Initialize backtest variables
             self.balance = 10000.0

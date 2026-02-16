@@ -2,16 +2,26 @@ from datetime import datetime
 from typing import List, Dict, Optional
 import random
 
-from .models import (
-    SourceType, SentimentBias, EmotionalTone, TimeHorizon,
-    RawSourceData, SourceClassification, SentimentAnalysis,
-    MarketDivergence, SmartMoneyInference, DecisionImpact, IntelligenceReport,
-    SourceType, SentimentBias, EmotionalTone, TimeHorizon
-)
-from .config import (
-    RETAIL_WEIGHT, SEMI_PROFESSIONAL_WEIGHT, PROFESSIONAL_ANALYST_WEIGHT,
-    INSTITUTIONAL_MACRO_WEIGHT, NOISE_WEIGHT, HIGH_DIVERGENCE_THRESHOLD
-)
+try:
+    from .models import (
+        SourceType, SentimentBias, EmotionalTone, TimeHorizon,
+        RawSourceData, SourceClassification, SentimentAnalysis,
+        MarketDivergence, SmartMoneyInference, DecisionImpact, IntelligenceReport
+    )
+    from .config import (
+        RETAIL_WEIGHT, SEMI_PROFESSIONAL_WEIGHT, PROFESSIONAL_ANALYST_WEIGHT,
+        INSTITUTIONAL_MACRO_WEIGHT, NOISE_WEIGHT, HIGH_DIVERGENCE_THRESHOLD
+    )
+except (ImportError, ValueError):
+    from market_intelligence.models import (
+        SourceType, SentimentBias, EmotionalTone, TimeHorizon,
+        RawSourceData, SourceClassification, SentimentAnalysis,
+        MarketDivergence, SmartMoneyInference, DecisionImpact, IntelligenceReport
+    )
+    from market_intelligence.config import (
+        RETAIL_WEIGHT, SEMI_PROFESSIONAL_WEIGHT, PROFESSIONAL_ANALYST_WEIGHT,
+        INSTITUTIONAL_MACRO_WEIGHT, NOISE_WEIGHT, HIGH_DIVERGENCE_THRESHOLD
+    )
 
 class SentimentIntelligenceEngine:
     def __init__(self, ai_api_client=None):

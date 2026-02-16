@@ -36,10 +36,77 @@ class TradingBrain:
         self.memories = []
         self.model_trained = False
         self.confidence_threshold = 0.6
+        self.sentiment_decision = "ALLOW"
+        self.risk_modifier = 1.0
+        self._load_memories()
+        self._check_sentiment_bias()
+
+    def _check_sentiment_bias(self):
+        """Load external market intelligence report"""
+        try:
+            report_file = Path("latest_intelligence_report.txt")
+            if report_file.exists():
+                with open(report_file, 'r') as f:
+                    content = f.read()
+                    if "DECISION:           BLOCK" in content:
+                        self.sentiment_decision = "BLOCK"
+                    elif "DECISION:           REDUCE" in content:
+                        self.sentiment_decision = "REDUCE"
+                        self.risk_modifier = 0.5
+                    else:
+                        self.sentiment_decision = "ALLOW"
+                        self.risk_modifier = 1.0
+                logger.info(f"📡 Market Intelligence: {self.sentiment_decision}")
+            else:
+                logger.warning("📡 No intelligence report found. Defaulting to ALLOW.")
+        except Exception as e:
+            logger.error(f"Failed to read sentiment report: {e}")
+
+    def _load_memories(self):
+        """Load trained memories from file"""
+        try:
+            memory_file = Path("models/ai_memories.json")
+            if memory_file.exists():
+                import json
+                with open(memory_file, 'r') as f:
+                    self.memories = json.load(f)
+                self.model_trained = True
+                logger.info(f"🧠 Loaded {len(self.memories)} training memories. AI is ready.")
+            else:
+                logger.warning("⚠️ No training data found. AI starting with blank slate.")
+        except Exception as e:
+            logger.error(f"Failed to load memories: {e}")
+
+    def _is_silver_bullet_time(self, timestamp: datetime) -> bool:
+        """
+        Check if time is within ICT Silver Bullet windows (EST based).
+        Windows: 3-4 AM (London), 10-11 AM (NY AM), 2-3 PM (NY PM).
         
+        We assume NY time for these windows.
+        """
+        # If user has not configured timezone, we assume current system time is NY or MT5 Server time.
+        # To be safe, we check 'MT5_SERVER_TIME_OFFSET' if defined in .env
+        offset = int(os.getenv("MT5_SERVER_TIME_OFFSET", 0))
+        adj_time = timestamp + timedelta(hours=offset)
+        h = adj_time.hour
+        
+        if h in [3, 10, 14]:
+            return True
+        return False
+
     def analyze_market(self, symbol: str, data: pd.DataFrame) -> Dict:
         """ICT/SMC AI market analysis"""
         try:
+            # Update sentiment from file regularly
+            self._check_sentiment_bias()
+            
+            if self.sentiment_decision == "BLOCK":
+                return {'action': 'HOLD', 'confidence': 0.0, 'reasoning': 'Intelligence Engine Decision: BLOCK'}
+
+            current_time = datetime.now()
+            if not self._is_silver_bullet_time(current_time):
+                 return {'action': 'HOLD', 'confidence': 0.0, 'reasoning': 'Outside Silver Bullet Windows (3-4, 10-11, 14-15)'}
+            
             if len(data) < 50:
                 return {'action': 'HOLD', 'confidence': 0.0, 'reasoning': 'Insufficient data'}
             
@@ -432,10 +499,25 @@ class MT5Broker:
         self.connected = False
         
     async def connect(self) -> bool:
-        """Connect to MT5"""
+        """Connect to MT5 with robust retries and session clearing"""
         try:
-            if not mt5.initialize():
-                logger.error("MT5 initialization failed")
+            # Force close any hung sessions first
+            mt5.shutdown()
+            await asyncio.sleep(1)
+            
+            terminal_path = r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe"
+            
+            success = False
+            for i in range(3):
+                logger.info(f"Connecting to MT5 (Attempt {i+1}/3)...")
+                if mt5.initialize(path=terminal_path):
+                    success = True
+                    break
+                logger.warning(f"Connection attempt {i+1} failed: {mt5.last_error()}")
+                await asyncio.sleep(2)
+                
+            if not success:
+                logger.error(f"MT5 could not be initialized after 3 attempts: {mt5.last_error()}")
                 return False
                 
             # Login with credentials
@@ -443,11 +525,17 @@ class MT5Broker:
             password = self.config.get('password') or os.getenv('MT5_PASSWORD')
             server = self.config.get('server') or os.getenv('MT5_SERVER')
             
+            logger.info(f"Logging into {server} (Account: {login})...")
             if login and password and server:
                 if not mt5.login(login, password=password, server=server):
                     logger.error(f"MT5 login failed: {mt5.last_error()}")
-                    return False
-                    
+                    # Fail-safe: Check if we are already logged in to this account
+                    acc = mt5.account_info()
+                    if acc and acc.login == login:
+                        logger.info("Terminal is already logged into the correct account manually. Proceeding.")
+                    else:
+                        return False
+            
             self.connected = True
             account_info = mt5.account_info()
             if account_info:

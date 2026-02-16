@@ -2,7 +2,10 @@ from abc import ABC, abstractmethod
 from typing import List
 from datetime import datetime
 import random
-from .models import RawSourceData
+try:
+    from .models import RawSourceData
+except (ImportError, ValueError):
+    from market_intelligence.models import RawSourceData
 
 class DataSource(ABC):
     @abstractmethod
