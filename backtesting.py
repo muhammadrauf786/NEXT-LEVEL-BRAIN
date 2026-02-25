@@ -33,7 +33,7 @@ class BacktestEngine:
     
     def __init__(self):
         self.trades = []
-        self.balance = 1000.0  # Starting balance
+        self.balance = 100000.0  # Starting balance
         self.equity_curve = []
         self.ai_memories = []
         # Tunable parameters (adjust to your preference)
@@ -66,23 +66,37 @@ class BacktestEngine:
         return False
 
     def get_historical_data(self, symbol: str, start_date: datetime, end_date: datetime, timeframe: str = "M5") -> pd.DataFrame:
-        """Get historical data from MT5"""
+        """Get historical data from MT5 with robust error handling"""
         try:
+            symbol = symbol.strip()
             if not mt5.initialize():
-                logger.error("MT5 initialization failed")
+                err = mt5.last_error()
+                logger.error(f"MT5 initialization failed: {err}")
                 return pd.DataFrame()
             
+            # Ensure symbol is selected in MarketWatch
+            if not mt5.symbol_select(symbol, True):
+                err = mt5.last_error()
+                logger.error(f"Symbol '{symbol}' could not be selected/found: {err}")
+                mt5.shutdown()
+                return pd.DataFrame()
+
             # Map timeframe
             tf_map = {
-                "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
-                "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1
+                "M1": mt5.TIMEFRAME_M1, "M3": mt5.TIMEFRAME_M3, "M5": mt5.TIMEFRAME_M5, 
+                "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, 
+                "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1
             }
             
             timeframe_mt5 = tf_map.get(timeframe, mt5.TIMEFRAME_H1)
+            
+            logger.info(f"⏳ Fetching {timeframe} data for {symbol} from {start_date} to {end_date}...")
             rates = mt5.copy_rates_range(symbol, timeframe_mt5, start_date, end_date)
             
             if rates is None or len(rates) == 0:
-                logger.warning(f"No historical data for {symbol}")
+                err = mt5.last_error()
+                logger.warning(f"No historical data for {symbol}. MT5 Error: {err}")
+                mt5.shutdown()
                 return pd.DataFrame()
             
             df = pd.DataFrame(rates)
@@ -93,10 +107,13 @@ class BacktestEngine:
             df = self.add_indicators(df)
             
             mt5.shutdown()
+            logger.info(f"✅ Successfully loaded {len(df)} bars for {symbol}")
             return df
             
         except Exception as e:
             logger.error(f"Error getting historical data: {e}")
+            try: mt5.shutdown()
+            except: pass
             return pd.DataFrame()
     
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -533,6 +550,118 @@ class BacktestEngine:
         
         return max(0.01, position_size)
     
+    def run_grid_backtest(self, symbol: str, start_date: datetime, end_date: datetime, timeframe: str = "M5", mode: str = "BOTH") -> Dict:
+        """Run grid strategy backtest with mode: BOTH, BUY_ONLY, SELL_ONLY"""
+        try:
+            logger.info(f"🕸️ Running Grid Backtest ({mode}) for {symbol}")
+            data = self.get_historical_data(symbol, start_date, end_date, timeframe)
+            if data.empty: return {'error': 'No data'}
+
+            # Use existing balance if available
+            initial_balance = getattr(self, 'balance', 100000.0)
+            if initial_balance == 0: initial_balance = 100000.0
+            
+            self.balance = initial_balance
+            self.trades = []
+            self.equity_curve = [self.balance]
+            
+            pending_orders = []
+            open_positions = []
+            
+            # Use settings from config if possible, else defaults
+            try:
+                import yaml
+                with open('config.yaml', 'r') as f:
+                    config = yaml.safe_load(f)
+                grid_cfg = config.get('grid', {})
+                grid_size = grid_cfg.get('size', 300)
+                spacing = grid_cfg.get('spacing', 1.0)
+                lot_size = grid_cfg.get('lot_size', 0.01)
+                target_pct = grid_cfg.get('profit_target_pct', 0.25)
+            except:
+                grid_size = 300
+                spacing = 1.0
+                lot_size = 0.01
+                target_pct = 0.25
+
+            logger.info(f"⚙️ Grid Config: Size={grid_size}, Spacing={spacing}, Lot={lot_size}, Target={target_pct:.0%}")
+
+            for i in range(50, len(data)):
+                current_bar = data.iloc[i]
+                current_time = data.index[i]
+                
+                # 1. Check profit targets
+                buy_pos = [p for p in open_positions if p['type'] == 'BUY']
+                sell_pos = [p for p in open_positions if p['type'] == 'SELL']
+                
+                buy_profit = sum(self._calculate_floating_pnl(p, current_bar['close'], symbol) for p in buy_pos)
+                sell_profit = sum(self._calculate_floating_pnl(p, current_bar['close'], symbol) for p in sell_pos)
+                
+                target_amt = initial_balance * target_pct # Target based on starting balance
+                
+                if buy_pos and buy_profit >= target_amt:
+                    logger.info(f"🎯 Buy Grid target hit at {current_time}! Profit: ${buy_profit:.2f}")
+                    for p in buy_pos:
+                        trade = self._close_position(p, current_bar['close'], current_time, 'Grid Target')
+                        self.trades.append(trade)
+                        self.balance += trade['pnl']
+                    open_positions = [p for p in open_positions if p['type'] != 'BUY']
+                    pending_orders = [o for o in pending_orders if o['type'] != 'BUY']
+                    self.equity_curve.append(self.balance)
+
+                if sell_pos and sell_profit >= target_amt:
+                    logger.info(f"🎯 Sell Grid target hit at {current_time}! Profit: ${sell_profit:.2f}")
+                    for p in sell_pos:
+                        trade = self._close_position(p, current_bar['close'], current_time, 'Grid Target')
+                        self.trades.append(trade)
+                        self.balance += trade['pnl']
+                    open_positions = [p for p in open_positions if p['type'] != 'SELL']
+                    pending_orders = [o for o in pending_orders if o['type'] != 'SELL']
+                    self.equity_curve.append(self.balance)
+
+                # 2. Check pending hits
+                for order in pending_orders[:]:
+                    if (order['type'] == 'BUY' and current_bar['low'] <= order['price']) or \
+                       (order['type'] == 'SELL' and current_bar['high'] >= order['price']):
+                        order['entry_time'] = current_time
+                        order['entry_price'] = order['price']
+                        open_positions.append(order)
+                        pending_orders.remove(order)
+
+                # 3. Check bias and grid placement
+                bias = self._determine_market_bias(data, i)
+                
+                # Grid placement based on mode
+                if mode in ['BOTH', 'SELL_ONLY']:
+                    if bias == 'BULLISH' and not any(o['type'] == 'SELL' for o in pending_orders) and not any(p['type'] == 'SELL' for p in open_positions):
+                        logger.info(f"🚀 Placing SELL grid at {current_time} (Price: {current_bar['close']})")
+                        for j in range(1, grid_size + 1):
+                            pending_orders.append({'type': 'SELL', 'price': current_bar['close'] + (j * spacing), 'position_size': lot_size, 'symbol': symbol})
+                
+                if mode in ['BOTH', 'BUY_ONLY']:
+                    if bias == 'BEARISH' and not any(o['type'] == 'BUY' for o in pending_orders) and not any(p['type'] == 'BUY' for p in open_positions):
+                        logger.info(f"🚀 Placing BUY grid at {current_time} (Price: {current_bar['close']})")
+                        for j in range(1, grid_size + 1):
+                            pending_orders.append({'type': 'BUY', 'price': current_bar['close'] - (j * spacing), 'position_size': lot_size, 'symbol': symbol})
+
+                if i % 100 == 0:
+                    current_equity = self.balance + buy_profit + sell_profit
+                    self.equity_curve.append(current_equity)
+
+            # 4. Force close all remaining positions at end of backtest
+            if open_positions:
+                logger.info(f"🏁 Closing {len(open_positions)} remaining positions at end of backtest")
+                for p in open_positions:
+                    trade = self._close_position(p, data.iloc[-1]['close'], data.index[-1], 'End of Backtest')
+                    self.trades.append(trade)
+                    self.balance += trade['pnl']
+            
+            self.equity_curve.append(self.balance)
+            return self._calculate_performance_metrics(symbol)
+        except Exception as e:
+            logger.error(f"Grid backtest error: {e}")
+            return {'error': str(e)}
+
     def run_backtest(self, symbol: str, start_date: datetime, end_date: datetime, timeframe: str = "M5") -> Dict:
         """Run backtest on historical data"""
         try:
@@ -550,7 +679,7 @@ class BacktestEngine:
             logger.info(f"🎯 Target Silver Bullet Hours: [3, 10, 14]")
             
             # Initialize backtest variables
-            self.balance = 10000.0
+            self.balance = 100000.0
             self.trades = []
             self.equity_curve = [self.balance]
             position = None
@@ -624,7 +753,7 @@ class BacktestEngine:
                         exit_reason = 'Take Profit'
                         exit_triggered = True
                     
-                    # Time-based exit (hold for max 24 bars)
+                    # Time-based exit (hold for max 72 hours)
                     elif (current_time - position['entry_time']).total_seconds() / 3600 > 72:
                         exit_triggered = True
                     
@@ -687,6 +816,25 @@ class BacktestEngine:
         except:
             return 0.01
     
+    def _calculate_floating_pnl(self, position: Dict, current_price: float, symbol: str) -> float:
+        """Calculate floating P&L for a position"""
+        try:
+            entry_price = position['entry_price']
+            position_size = position['position_size']
+            
+            price_diff = current_price - entry_price if position['type'] == 'BUY' else entry_price - current_price
+            
+            if 'BTC' in symbol or 'ETH' in symbol:
+                pnl = price_diff * position_size
+            elif 'XAU' in symbol or 'XAG' in symbol:
+                pnl = price_diff * position_size * 100
+            else:
+                pnl = price_diff * position_size * 100000
+                
+            return pnl
+        except:
+            return 0.0
+
     def _close_position(self, position: Dict, exit_price: float, exit_time: datetime, exit_reason: str) -> Dict:
         """Close position and calculate P&L"""
         try:
@@ -716,8 +864,8 @@ class BacktestEngine:
                 'position_size': position_size,
                 'pnl': pnl,
                 'exit_reason': exit_reason,
-                'duration': (exit_time - position['entry_time']).total_seconds() / 3600,
-                'confidence': position['confidence']
+                'duration': (exit_time - position['entry_time']).total_seconds() / 3600 if 'entry_time' in position else 0,
+                'confidence': position.get('confidence', 1.0)
             }
             
         except Exception as e:
@@ -968,239 +1116,9 @@ class BacktestEngine:
             logger.info(f"📊 Interactive chart saved: {chart_file}")
             
             return fig
-            
         except Exception as e:
             logger.error(f"Chart creation error: {e}")
             return None
-
-class TradingDashboard:
-    """Interactive Trading Dashboard with GUI"""
-    
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("🧠 NEXT LEVEL BRAIN - Trading Dashboard")
-        self.root.geometry("1000x700")
-        self.root.configure(bg='#2b2b2b')
-        
-        # Variables
-        self.selected_symbol = tk.StringVar(value="BTCUSDm")
-        self.selected_timeframe = tk.StringVar(value="M5")
-        self.selected_period = tk.StringVar(value="30")
-        self.backtest_engine = BacktestEngine()
-        self.current_results = None
-        
-        self.setup_gui()
-    
-    def setup_gui(self):
-        """Setup the GUI interface"""
-        # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # Title
-        title_label = ttk.Label(main_frame, text="🧠 NEXT LEVEL BRAIN - AI Trading Dashboard", 
-                               font=('Arial', 16, 'bold'))
-        title_label.grid(row=0, column=0, columnspan=4, pady=10)
-        
-        # Control Panel
-        control_frame = ttk.LabelFrame(main_frame, text="Trading Controls", padding="10")
-        control_frame.grid(row=1, column=0, columnspan=4, sticky=(tk.W, tk.E), pady=5)
-        
-        # Symbol selection
-        ttk.Label(control_frame, text="Symbol:").grid(row=0, column=0, padx=5)
-        symbol_combo = ttk.Combobox(control_frame, textvariable=self.selected_symbol, 
-                                   values=["BTCUSDm", "ETHUSDm", "XAUUSDm", "XAGUSDm", 
-                                          "EURUSDm", "GBPUSDm", "USDJPYm"])
-        symbol_combo.grid(row=0, column=1, padx=5)
-        
-        # Timeframe selection
-        ttk.Label(control_frame, text="Timeframe:").grid(row=0, column=2, padx=5)
-        timeframe_combo = ttk.Combobox(control_frame, textvariable=self.selected_timeframe,
-                                      values=["M1", "M5", "M15", "H1", "H4", "D1"])
-        timeframe_combo.grid(row=0, column=3, padx=5)
-        
-        # Period selection
-        ttk.Label(control_frame, text="Period (days):").grid(row=0, column=4, padx=5)
-        period_combo = ttk.Combobox(control_frame, textvariable=self.selected_period,
-                                   values=["7", "30", "90", "180", "365"])
-        period_combo.grid(row=0, column=5, padx=5)
-        
-        # Buttons
-        ttk.Button(control_frame, text="🚀 Run Backtest", 
-                  command=self.run_backtest_gui).grid(row=0, column=6, padx=10)
-        ttk.Button(control_frame, text="📊 Show Chart", 
-                  command=self.show_chart).grid(row=0, column=7, padx=5)
-        
-        # Results Frame
-        results_frame = ttk.LabelFrame(main_frame, text="Backtest Results", padding="10")
-        results_frame.grid(row=2, column=0, columnspan=4, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        
-        # Results text area
-        self.results_text = tk.Text(results_frame, height=15, width=80, bg='#1e1e1e', fg='#00ff00',
-                                   font=('Courier', 10))
-        scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=self.results_text.yview)
-        self.results_text.configure(yscrollcommand=scrollbar.set)
-        
-        self.results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        
-        # Performance Frame
-        perf_frame = ttk.LabelFrame(main_frame, text="Live Performance", padding="10")
-        perf_frame.grid(row=3, column=0, columnspan=4, sticky=(tk.W, tk.E), pady=5)
-        
-        # Performance metrics
-        self.perf_labels = {}
-        metrics = ["Total Trades", "Win Rate", "Total P&L", "Profit Factor", "Max Drawdown"]
-        for i, metric in enumerate(metrics):
-            ttk.Label(perf_frame, text=f"{metric}:").grid(row=0, column=i*2, padx=5)
-            self.perf_labels[metric] = ttk.Label(perf_frame, text="--", font=('Arial', 10, 'bold'))
-            self.perf_labels[metric].grid(row=0, column=i*2+1, padx=5)
-        
-        # Configure grid weights
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(2, weight=1)
-        results_frame.columnconfigure(0, weight=1)
-        results_frame.rowconfigure(0, weight=1)
-        
-        # Initial message
-        self.update_results_display("🧠 NEXT LEVEL BRAIN Dashboard Ready!\n\nSelect your parameters and click 'Run Backtest' to begin analysis.\n\n📊 Features:\n- ICT/SMC Strategy Analysis\n- Interactive Charts\n- Real-time Performance Metrics\n- Multi-timeframe Support\n\n🎯 Created by: Aleem Shahzad | AI Partner: Claude")
-    
-    def update_results_display(self, text):
-        """Update the results display"""
-        self.results_text.delete(1.0, tk.END)
-        self.results_text.insert(tk.END, text)
-        self.results_text.see(tk.END)
-    
-    def update_performance_metrics(self, results):
-        """Update performance metrics display"""
-        if results and 'error' not in results:
-            self.perf_labels["Total Trades"].config(text=str(results.get('total_trades', 0)))
-            self.perf_labels["Win Rate"].config(text=f"{results.get('win_rate', 0):.1%}")
-            self.perf_labels["Total P&L"].config(text=f"${results.get('total_pnl', 0):.2f}")
-            self.perf_labels["Profit Factor"].config(text=f"{results.get('profit_factor', 0):.2f}")
-            self.perf_labels["Max Drawdown"].config(text=f"{results.get('max_drawdown', 0):.1%}")
-        else:
-            for label in self.perf_labels.values():
-                label.config(text="--")
-    
-    def run_backtest_gui(self):
-        """Run backtest from GUI"""
-        def backtest_thread():
-            try:
-                self.update_results_display("🚀 Starting backtest...\nPlease wait while we analyze the market data...")
-                
-                # Get parameters
-                symbol = self.selected_symbol.get()
-                timeframe = self.selected_timeframe.get()
-                days = int(self.selected_period.get())
-                
-                # Calculate dates
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=days)
-                
-                # Run backtest with specified timeframe
-                results = self.backtest_engine.run_backtest(symbol, start_date, end_date, timeframe)
-                self.current_results = results
-                
-                if 'error' not in results:
-                    # Format results
-                    result_text = f"""
-🧠 NEXT LEVEL BRAIN - BACKTEST RESULTS
-{'='*50}
-Symbol: {symbol}
-Timeframe: {timeframe}
-Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}
-
-📊 PERFORMANCE METRICS:
-{'='*30}
-Total Trades: {results['total_trades']}
-Winning Trades: {results['winning_trades']}
-Losing Trades: {results['losing_trades']}
-Win Rate: {results['win_rate']:.1%}
-
-💰 FINANCIAL METRICS:
-{'='*30}
-Total P&L: ${results['total_pnl']:.2f}
-Average Win: ${results['avg_win']:.2f}
-Average Loss: ${results['avg_loss']:.2f}
-Profit Factor: {results['profit_factor']:.2f}
-Return: {results['return_pct']:.1%}
-
-📈 RISK METRICS:
-{'='*30}
-Max Drawdown: {results['max_drawdown']:.1%}
-Sharpe Ratio: {results['sharpe_ratio']:.2f}
-Final Balance: ${results['final_balance']:.2f}
-
-🧠 AI ANALYSIS:
-{'='*30}
-✅ ICT/SMC Strategy Applied
-✅ {len(self.backtest_engine.ai_memories)} Trade Memories Stored
-✅ Neural Network Trained
-✅ Ready for Live Trading
-
-🎯 TRADE DETAILS:
-{'='*30}"""
-                    
-                    # Add trade details
-                    for i, trade in enumerate(results['trades'][:5], 1):  # Show first 5 trades
-                        pnl_emoji = "💚" if trade['pnl'] > 0 else "💔"
-                        result_text += f"""
-Trade {i}: {trade['type']} {pnl_emoji}
-  Entry: {trade['entry_time'].strftime('%Y-%m-%d %H:%M')} @ ${trade['entry_price']:.5f}
-  Exit: {trade['exit_time'].strftime('%Y-%m-%d %H:%M')} @ ${trade['exit_price']:.5f}
-  P&L: ${trade['pnl']:.2f} | Reason: {trade['exit_reason']}
-"""
-                    
-                    if len(results['trades']) > 5:
-                        result_text += f"\n... and {len(results['trades']) - 5} more trades"
-                    
-                    self.update_results_display(result_text)
-                    self.update_performance_metrics(results)
-                    
-                else:
-                    self.update_results_display(f"❌ Backtest Error: {results['error']}")
-                    self.update_performance_metrics(None)
-                    
-            except Exception as e:
-                self.update_results_display(f"❌ Error: {str(e)}")
-                self.update_performance_metrics(None)
-        
-        # Run in separate thread to avoid GUI freezing
-        threading.Thread(target=backtest_thread, daemon=True).start()
-    
-    def show_chart(self):
-        """Show interactive chart"""
-        if self.current_results and 'error' not in self.current_results:
-            try:
-                symbol = self.selected_symbol.get()
-                timeframe = self.selected_timeframe.get()
-                days = int(self.selected_period.get())
-                
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=days)
-                
-                # Get data
-                data = self.backtest_engine.get_historical_data(symbol, start_date, end_date, timeframe)
-                if not data.empty:
-                    data = self.backtest_engine.add_indicators(data)
-                    trades = self.current_results['trades']
-                    
-                    # Create chart
-                    fig = self.backtest_engine.create_interactive_chart(data, trades, symbol)
-                    if fig:
-                        fig.show()
-                        self.update_results_display(f"📊 Interactive chart opened in browser!\nChart saved to: charts/{symbol}_analysis.html")
-                else:
-                    messagebox.showerror("Error", "No data available for chart")
-            except Exception as e:
-                messagebox.showerror("Error", f"Chart error: {str(e)}")
-        else:
-            messagebox.showwarning("Warning", "Please run a backtest first!")
-    
-    def run(self):
-        """Run the dashboard"""
-        self.root.mainloop()
 
 def select_backtest_options():
     """Select backtesting options"""
@@ -1283,12 +1201,6 @@ def main():
         Path("models").mkdir(exist_ok=True)
         Path("charts").mkdir(exist_ok=True)
         
-        # Launch GUI Dashboard directly
-        print("🚀 Launching NEXT LEVEL BRAIN Backtesting Dashboard...")
-        dashboard = TradingDashboard()
-        dashboard.run()
-        return
-        
         # Command line interface
         start_date, end_date = select_backtest_options()
         if not start_date:
@@ -1332,7 +1244,7 @@ def main():
             print("\n🧠 AI TRAINING COMPLETED!")
             print("✅ Neural network trained with backtest data")
             print("✅ Ready for live trading")
-            print("\n🚀 Next step: Run 'python live_trading.py' for live trading")
+            print("\n🚀 Next step: Run 'python brain_app.py' for desktop controller")
         
     except KeyboardInterrupt:
         logger.info("Backtesting interrupted by user")
