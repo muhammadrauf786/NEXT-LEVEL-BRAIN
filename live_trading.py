@@ -1055,6 +1055,14 @@ class LiveTradingSystem:
             
             self.running = True
             try:
+                # On every fresh startup: write new dashboard_reset.json so history starts from NOW
+                try:
+                    dash_reset_file = Path("logs/dashboard_reset.json")
+                    dash_reset_file.parent.mkdir(parents=True, exist_ok=True)
+                    with open(dash_reset_file, 'w') as f:
+                        json.dump({'reset_timestamp': time.time()}, f)
+                except: pass
+
                 # Sync Equity Milestone Baseline on Startup
                 acc = mt5.account_info()
                 if acc:
