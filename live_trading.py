@@ -1065,6 +1065,18 @@ class LiveTradingSystem:
                     reset_signal = Path("logs/global_reset.signal")
                     has_pending_reset = reset_signal.exists()
                     
+                    # If reset is pending: immediately zero out the dashboard bridge file
+                    # so the dashboard shows $0.00 right away (BEFORE main loop detects the signal)
+                    if has_pending_reset:
+                        try:
+                            progress_file = Path("logs/milestone_progress.json")
+                            progress_file.parent.mkdir(parents=True, exist_ok=True)
+                            with open(progress_file, 'w') as f:
+                                json.dump({'current': acc.equity, 'baseline': acc.equity,
+                                           'target': acc.equity + 100.0, 'progress': 0.0,
+                                           'target_inc': 100.0, 'timestamp': time.time()}, f)
+                        except: pass
+                    
                     # Only auto-sync if: no baseline set, or equity dropped significantly below baseline
                     # Do NOT auto-sync if a pending reset exists (reset flow will handle it)
                     # Do NOT auto-sync if baseline is valid and close to current equity
