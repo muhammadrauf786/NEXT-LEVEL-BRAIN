@@ -1127,6 +1127,13 @@ class LiveTradingSystem:
 
                         try:
                             reset_signal.unlink() # Delete signal
+                            # Update dashboard reset timestamp so history shows 0 on fresh restart
+                            try:
+                                dash_reset_file = Path("logs/dashboard_reset.json")
+                                dash_reset_file.parent.mkdir(parents=True, exist_ok=True)
+                                with open(dash_reset_file, 'w') as f:
+                                    json.dump({'reset_timestamp': time.time()}, f)
+                            except: pass
                             logger.success("✅ Global Reset Complete. System Clean.")
                             # Set fresh baseline from current equity so restart loads correct data
                             if acc:
