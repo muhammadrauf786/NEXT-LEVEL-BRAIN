@@ -1060,13 +1060,22 @@ class LiveTradingSystem:
                 if acc:
                     ctrl = self.grid_manager.profit_ctrl
                     stored_baseline = ctrl.equity_milestone_state.get('baseline_equity', 0)
-                    # If no baseline or baseline is significantly HIGHER than current (meaning we had a loss)
-                    # Auto-sync it so the $100 target starts from current reality
-                    if stored_baseline <= 0 or acc.equity < (stored_baseline - 10):
-                        logger.info(f"🔄 Auto-Syncing Equity Baseline to current equity: ${acc.equity:.2f}")
-                    # Auto-Sync Baseline if not set or significantly different
-                    ctrl.reset_equity_milestone(acc.equity)
-                    logger.info(f"📊 Equity Milestone Synced. Baseline: ${acc.equity:.2f} | Target: ${acc.equity+100:.2f}")
+                    
+                    # Check if a reset signal is pending (dashboard reset was just done)
+                    reset_signal = Path("logs/global_reset.signal")
+                    has_pending_reset = reset_signal.exists()
+                    
+                    # Only auto-sync if: no baseline set, or equity dropped significantly below baseline
+                    # Do NOT auto-sync if a pending reset exists (reset flow will handle it)
+                    # Do NOT auto-sync if baseline is valid and close to current equity
+                    if not has_pending_reset:
+                        if stored_baseline <= 0 or acc.equity < (stored_baseline - 10):
+                            logger.info(f"🔄 Auto-Syncing Equity Baseline to current equity: ${acc.equity:.2f}")
+                            ctrl.reset_equity_milestone(acc.equity)
+                            logger.info(f"📊 Equity Milestone Synced. Baseline: ${acc.equity:.2f} | Target: ${acc.equity+100:.2f}")
+                        else:
+                            # Baseline is valid, just log it
+                            logger.info(f"📊 Equity Milestone Loaded. Baseline: ${stored_baseline:.2f} | Target: ${stored_baseline+100:.2f}")
             except Exception as e:
                 logger.error(f"Error during equity baseline sync: {e}")
 
@@ -1107,6 +1116,9 @@ class LiveTradingSystem:
                         try:
                             reset_signal.unlink() # Delete signal
                             logger.success("✅ Global Reset Complete. System Clean.")
+                            # Set fresh baseline from current equity so restart loads correct data
+                            if acc:
+                                self.grid_manager.profit_ctrl.reset_equity_milestone(acc.equity)
                         except Exception as e:
                             logger.error(f"Failed to delete reset signal: {e}")
                         
