@@ -206,14 +206,57 @@ class LivePortfolioDashboard:
         if not messagebox.askyesno("Confirm Full Reset", msg): 
             return
         
-        # Signal the main script to wipe everything
+        closed_pos = 0
+        cancelled_orders = 0
+        
+        # Step 1: Close ALL active positions directly via MT5
+        try:
+            positions = mt5.positions_get()
+            if positions:
+                for pos in positions:
+                    sym_info = mt5.symbol_info(pos.symbol)
+                    if not sym_info: continue
+                    order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                    tick = mt5.symbol_info_tick(pos.symbol)
+                    price = tick.bid if pos.type == mt5.POSITION_TYPE_BUY else tick.ask
+                    req = {
+                        "action": mt5.TRADE_ACTION_DEAL,
+                        "symbol": pos.symbol,
+                        "volume": pos.volume,
+                        "type": order_type,
+                        "position": pos.ticket,
+                        "price": price,
+                        "deviation": 50,
+                        "magic": pos.magic,
+                        "comment": "DASHBOARD_RESET",
+                        "type_time": mt5.ORDER_TIME_GTC,
+                        "type_filling": mt5.ORDER_FILLING_IOC,
+                    }
+                    res = mt5.order_send(req)
+                    if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                        closed_pos += 1
+        except Exception as e:
+            print(f"Error closing positions: {e}")
+        
+        # Step 2: Cancel ALL pending orders directly via MT5
+        try:
+            orders = mt5.orders_get()
+            if orders:
+                for order in orders:
+                    req = {"action": mt5.TRADE_ACTION_REMOVE, "order": order.ticket}
+                    res = mt5.order_send(req)
+                    if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                        cancelled_orders += 1
+        except Exception as e:
+            print(f"Error cancelling orders: {e}")
+
+        # Step 3: Signal the main script to also reset its internal state
         try:
             signal_file = Path("logs/global_reset.signal")
             signal_file.parent.mkdir(parents=True, exist_ok=True)
             with open(signal_file, 'w') as f:
                 f.write(str(datetime.now().timestamp()))
         except Exception as e:
-            # logger not defined in this file, use print
             print(f"Failed to write reset signal: {e}")
 
         reset_point = datetime.now().timestamp()
@@ -229,7 +272,8 @@ class LivePortfolioDashboard:
         self.start_time = time.time()
         self._save_session_stats()
         
-        messagebox.showinfo("Reset Successful", "Performance metrics and Session Timer have been reset.")
+        messagebox.showinfo("Reset Successful", 
+                           f"✅ Reset Complete!\n\nClosed: {closed_pos} positions\nCancelled: {cancelled_orders} pending orders\nStats & Timer reset.")
     def _generate_report(self):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         report_path = Path(f"logs/live_reports/dashboard_report_{timestamp}.json")
