@@ -505,7 +505,6 @@ class ICTAnalyzer:
             logger.error(f"Order block detection error: {e}")
             return []
 
-
 class RiskManager:
     """Risk Management System"""
     
@@ -609,9 +608,6 @@ class GridManager:
                         data = self.active_grids[symbol]
                         if 'type' in data: # Check for old structure
                             side = data['type']
-                            # Remove 'type' key if it's not needed in the new nested structure
-                            # For now, just wrap it. The 'type' key inside the nested dict is redundant
-                            # but harmless if not explicitly used.
                             del data['type'] # Remove the top-level 'type'
                             self.active_grids[symbol] = {side: data}
                             logger.info(f"🚚 Migrated legacy grid state for {symbol} ({side})")
@@ -624,65 +620,6 @@ class GridManager:
                 self.active_grids = {}
         else:
             self.active_grids = {}
-
-    async def _close_all_grid(self, symbol):
-        """Helper to close all grid orders and clear state"""
-        await self._close_all_grid_side(symbol, mt5.ORDER_TYPE_BUY)
-        await self._close_all_grid_side(symbol, mt5.ORDER_TYPE_SELL)
-        await self.broker.cancel_all_pendings(symbol)
-        if symbol in self.active_grids:
-            del self.active_grids[symbol]
-        self._save_state()
-
-    async def _recycle_level(self, symbol: str, price: float, side_type: int):
-        """Immediately re-place a pending order at the level that just closed. Uses broker's built-in retry."""
-        try:
-            magic = self.magic_buy if side_type == mt5.POSITION_TYPE_BUY else self.magic_sell
-            order_type = mt5.ORDER_TYPE_BUY_LIMIT if side_type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_SELL_LIMIT
-            
-            # Normalize price to tick size
-            symbol_info = mt5.symbol_info(symbol)
-            if symbol_info:
-                tick_size = getattr(symbol_info, 'trade_tick_size', 0.0)
-                if tick_size > 0:
-                    price = round(round(price / tick_size) * tick_size, symbol_info.digits)
-
-            side_str = 'BUY' if side_type == mt5.POSITION_TYPE_BUY else 'SELL'
-            
-            # Use broker's resilient place_pending_order (already has infinite retry)
-            res = await self.broker.place_pending_order(symbol, order_type, self.lot_size, price, magic)
-            
-            if res.get('success'):
-                logger.info(f"♻️ Level Recycled: {side_str} Limit replaced at {price:.3f}")
-            elif res.get('error') == 'MARKET_CLOSED':
-                logger.info(f"⏸️ Market Closed: Stopped recycling {side_str} at {price:.3f}")
-            else:
-                logger.warning(f"❌ Failed to recycle level at {price:.3f}: {res.get('error')}")
-
-        except Exception as e:
-            logger.error(f"Error recycling level: {e}")
-
-    async def _close_all_grid_side(self, symbol, side_type):
-        """Close only one side of the grid (BUY or SELL)"""
-        side_str = 'BUY' if side_type == mt5.ORDER_TYPE_BUY else 'SELL'
-        magic = self.magic_buy if side_type == mt5.ORDER_TYPE_BUY else self.magic_sell
-        
-        await self.broker.close_all_side(symbol, side_str, magic)
-        
-        # Side-specific pending cancellation
-        active_pendings = mt5.orders_get(symbol=symbol)
-        if active_pendings:
-            side_pendings = [o for o in active_pendings if o.magic == magic]
-            for o in side_pendings:
-                await self.broker.cancel_order(o.ticket)
-                
-        if symbol in self.active_grids and side_str in self.active_grids[symbol]:
-            del self.active_grids[symbol][side_str]
-            if not self.active_grids[symbol]: # If no sides left for symbol, remove symbol entry
-                del self.active_grids[symbol]
-        
-        self.profit_ctrl.reset(side_str)
-        self._save_state()
 
     async def update(self, symbol, current_price, bias, balance):
         """Update grid logic based on bias and profit"""
@@ -717,7 +654,8 @@ class GridManager:
             if self.mode in ('SELL_ONLY', 'BOTH'):
                 sell_pendings = [o for o in grid_pendings if o.magic == self.magic_sell]
                 sell_positions = [p for p in grid_objs if p.magic == self.magic_sell]
-                grid_info_root = self.active_grids.get(symbol, {})
+                if symbol not in self.active_grids: self.active_grids[symbol] = {}
+                grid_info_root = self.active_grids[symbol]
                 grid_info = grid_info_root.get('SELL', {})
                 
                 # Reset if no active orders or fresh start
@@ -757,7 +695,6 @@ class GridManager:
                     num_to_place = self.batch_size
                     success_count = 0
                     start_price = base_price + ((last_idx + 1) * self.spacing)
-                    end_price = start_price
                     for _ in range(num_to_place):
                         last_idx += 1
                         entry_price = base_price + (last_idx * self.spacing)
@@ -766,14 +703,9 @@ class GridManager:
                         res = await self.broker.place_pending_order(symbol, mt5.ORDER_TYPE_SELL_LIMIT, self.lot_size, entry_price, self.magic_sell)
                         if res['success']: 
                             success_count += 1
-                            end_price = entry_price
                         elif res.get('error') == 'MARKET_CLOSED':
                             break # Silent halt
                     
-                    if success_count > 0:
-                        logger.info(f"🔄 SELL Expansion: {success_count} levels added (${start_price:.2f} to ${end_price:.2f}, LastIdx: {last_idx})")
-
-                # Save state
                 if symbol not in self.active_grids: self.active_grids[symbol] = {}
                 self.active_grids[symbol]['SELL'] = {'base_price': base_price, 'first_index': first_idx, 'last_index': last_idx}
                 self._save_state()
@@ -781,7 +713,8 @@ class GridManager:
             # 4. Dynamic Grid Logic (BUY Side)
             if self.mode in ('BUY_ONLY', 'BOTH'):
                 buy_pendings = [o for o in grid_pendings if o.magic == self.magic_buy]
-                grid_info_root = self.active_grids.get(symbol, {})
+                if symbol not in self.active_grids: self.active_grids[symbol] = {}
+                grid_info_root = self.active_grids[symbol]
                 grid_info = grid_info_root.get('BUY', {})
                 
                 if not grid_info or (not buy_pendings and not [p for p in grid_objs if p.magic == self.magic_buy]):
@@ -803,7 +736,6 @@ class GridManager:
                         entry_price = base_price - (new_idx * self.spacing)
                         # Spread safety
                         if entry_price >= current_price - (symbol_info.spread * symbol_info.point): break
-                        
                         res = await self.broker.place_pending_order(symbol, mt5.ORDER_TYPE_BUY_LIMIT, self.lot_size, entry_price, self.magic_buy)
                         if res['success']:
                             first_idx -= 1
@@ -818,30 +750,53 @@ class GridManager:
                 # B. EXPANSION (Back-end): Market moves DOWN (against positions)
                 if len(buy_pendings) <= self.trigger_threshold and last_idx < self.total_target:
                     num_to_place = self.batch_size
-                    success_count = 0
-                    start_price = base_price - ((last_idx + 1) * self.spacing)
-                    end_price = start_price
                     for _ in range(num_to_place):
                         last_idx += 1
                         entry_price = base_price - (last_idx * self.spacing)
                         if entry_price >= current_price - (symbol_info.spread * symbol_info.point): continue
                         res = await self.broker.place_pending_order(symbol, mt5.ORDER_TYPE_BUY_LIMIT, self.lot_size, entry_price, self.magic_buy)
-                        if res['success']: 
-                            success_count += 1
-                            end_price = entry_price
-                        elif res.get('error') == 'MARKET_CLOSED':
+                        if res.get('error') == 'MARKET_CLOSED':
                             break
                     
-                    if success_count > 0:
-                        logger.info(f"🔄 BUY Expansion: {success_count} levels added (${start_price:.2f} to ${end_price:.2f}, LastIdx: {last_idx})")
-
-                # Save state
-                if symbol not in self.active_grids: self.active_grids[symbol] = {}
                 self.active_grids[symbol]['BUY'] = {'base_price': base_price, 'first_index': first_idx, 'last_index': last_idx}
                 self._save_state()
 
         except Exception as e:
             logger.error(f"Error in grid update: {e}")
+
+    async def _recycle_level(self, symbol: str, price: float, pos_type: int):
+        """Immediately re-place a pending order at the level that just closed."""
+        try:
+            symbol_info = mt5.symbol_info(symbol)
+            if not symbol_info: return
+
+            side = "BUY" if pos_type == mt5.POSITION_TYPE_BUY else "SELL"
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT if side == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
+            magic = self.magic_buy if side == "BUY" else self.magic_sell
+            
+            # Normalize price
+            tick_size = getattr(symbol_info, 'trade_tick_size', 0.0)
+            if tick_size > 0:
+                price = round(round(price / tick_size) * tick_size, symbol_info.digits)
+
+            # Safety check: ensure price is not too close to market
+            tick = mt5.symbol_info_tick(symbol)
+            if tick:
+                # Small buffer (1.5x spread) to avoid INVALID_PRICE rejection
+                buffer = symbol_info.spread * symbol_info.point * 1.5
+                if side == "BUY" and price >= tick.ask - buffer:
+                    return # Market moved past level or too close
+                if side == "SELL" and price <= tick.bid + buffer:
+                    return # Market moved past level or too close
+
+            res = await self.broker.place_pending_order(symbol, order_type, self.lot_size, price, magic)
+            if res.get('success'):
+                logger.info(f"♻️ Level Recycled: {side} Limit replaced at {price:.3f}")
+            else:
+                logger.warning(f"Failed to recycle level at {price:.3f}: {res.get('error')}")
+                    
+        except Exception as e:
+            logger.error(f"Error recycling level: {e}")
 
 class LiveTradingSystem:
     """Main Live Trading System"""
@@ -936,32 +891,6 @@ class LiveTradingSystem:
             if not acc: return
             balance = acc.balance
 
-            # 0. Market Status Check (Halt if closed/disabled or feed frozen)
-            sym_info = mt5.symbol_info(symbol)
-            tick = mt5.symbol_info_tick(symbol)
-            
-            is_closed = False
-            if sym_info and sym_info.trade_mode in [mt5.SYMBOL_TRADE_MODE_DISABLED, mt5.SYMBOL_TRADE_MODE_CLOSEONLY]:
-                is_closed = True
-            
-            # Additional Check: Frozen Feed (e.g. Session breaks where trade_mode stays FULL)
-            if not is_closed and tick:
-                from datetime import datetime
-                tick_time = datetime.fromtimestamp(tick.time)
-                now = datetime.now()
-                # If no tick for more than 60 seconds during M1 trading, it's likely a session break
-                if (now - tick_time).total_seconds() > 60:
-                    is_closed = True
-
-            if is_closed:
-                if symbol not in self.market_closed_logged:
-                    logger.warning(f"⏸️ Market for {symbol} is CLOSED (or Feed Frozen). Pausing operations.")
-                    self.market_closed_logged.add(symbol)
-                return
-            elif symbol in self.market_closed_logged:
-                logger.info(f"▶️ Market for {symbol} has REOPENED. Resuming operations.")
-                self.market_closed_logged.remove(symbol)
-
             # Get market data
             data = self.broker.get_market_data(symbol, self.timeframe, 500)
             if data.empty:
@@ -997,7 +926,6 @@ class LiveTradingSystem:
                 else:
                     self.grid_recycler.mode = "BOTH"
                 await self.grid_recycler.update(symbol, current_price)
-            
             # 2. ICT SMC Strategy Logic
             elif self.strategy == "ICT SMC":
                 if ai_analysis['action'] in ['BUY', 'SELL'] and ai_analysis['confidence'] >= 0.70:
@@ -1136,7 +1064,9 @@ class LiveTradingSystem:
                     # Auto-sync it so the $100 target starts from current reality
                     if stored_baseline <= 0 or acc.equity < (stored_baseline - 10):
                         logger.info(f"🔄 Auto-Syncing Equity Baseline to current equity: ${acc.equity:.2f}")
-                        ctrl.reset_equity_milestone(acc.equity)
+                    # Auto-Sync Baseline if not set or significantly different
+                    ctrl.reset_equity_milestone(acc.equity)
+                    logger.info(f"📊 Equity Milestone Synced. Baseline: ${acc.equity:.2f} | Target: ${acc.equity+100:.2f}")
             except Exception as e:
                 logger.error(f"Error during equity baseline sync: {e}")
 
@@ -1146,13 +1076,15 @@ class LiveTradingSystem:
             
             while self.running:
                 try:
-                    # Connection Watchdog (Heartbeat)
+                    # Connection Watchdog
                     if not await self.broker.is_connected():
-                        logger.warning("📡 Connection unstable or lost. Waiting for Internet/MT5...")
+                        logger.warning("📡 Connection lost! Attempting to reconnect...")
+                        # Wait exponentially or simply retry
                         if await self.broker.connect():
-                            logger.info("✅ System synchronized. Connection restored!")
+                            logger.info("✅ Reconnected successfully!")
                         else:
-                            await asyncio.sleep(10) # Wait and retry
+                            logger.error("❌ Reconnect failed. Retrying in 10 seconds...")
+                            await asyncio.sleep(10)
                             continue
 
                     cycle_count += 1
@@ -1164,6 +1096,14 @@ class LiveTradingSystem:
                         logger.warning("🛑 GLOBAL RESET SIGNAL DETECTED! Performing full wipe...")
                         await self._close_all_universe()
                         self.grid_manager.profit_ctrl.reset() # Clears all peaks, locks, and milestones
+                        
+                        # Reset internal stats for terminal display
+                        self.trades_today = 0
+                        self.daily_pnl = 0.0
+                        if acc:
+                            self.start_balance = acc.balance
+                            logger.info(f"🎯 Milestone Baseline Set: ${acc.balance:.2f}. Target: ${acc.balance+100:.2f}")
+
                         try:
                             reset_signal.unlink() # Delete signal
                             logger.success("✅ Global Reset Complete. System Clean.")
@@ -1212,6 +1152,11 @@ class LiveTradingSystem:
                     # Update session history (Every ~10 seconds) - Skip if silent
                     if not all_closed and cycle_count % 100 == 0:
                         self._update_session_history()
+                    
+                    # Update session history and save partial report
+                    self._update_session_history()
+                    if cycle_count % 20 == 0:
+                        self.generate_session_report()
                     
                     # Wait before next cycle
                     if all_closed:
@@ -1394,7 +1339,7 @@ def select_trade_setup():
             break
         if choice == "3": strategy = "ICT SMC"; break
         if choice == "4":
-            print("🚀 Opening Live Dashboard...")
+            print(" Opening Live Dashboard...")
             import subprocess
             subprocess.Popen([sys.executable, "live_dashboard.py"], creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0)
             print("✅ Dashboard launched. Continuing...")
@@ -1479,32 +1424,47 @@ def select_trade_setup():
 
     # 3. Timeframe
     print("\n⏰ SELECT TIMEFRAME:")
-    tfs = ["M1", "M3", "M5", "M15", "M30", "H1", "H4", "D1"]
-    for i, tf in enumerate(tfs, 1):
-        print(f"{i}. {tf}")
+    print("1. M1")
+    print("2. M3")
+    print("3. M5")
+    print("4. M15")
+    print("5. M30")
+    print("6. H1")
+    print("7. H4")
+    print("8. D1")
     
     timeframe = "M1"
     while True:
         try:
-            choice = int(input(f"Choice (1-{len(tfs)}): ").strip())
-            if 1 <= choice <= len(tfs):
-                timeframe = tfs[choice-1]
+            choice = input("Choice (1-8) [Default 1]: ").strip()
+            if not choice: timeframe = "M1"; break
+            
+            tf_map = {
+                "1": "M1", "2": "M3", "3": "M5", "4": "M15",
+                "5": "M30", "6": "H1", "7": "H4", "8": "D1"
+            }
+            if choice in tf_map:
+                timeframe = tf_map[choice]
                 break
         except: pass
         print("Invalid choice.")
 
-    # 4. Lot Size Selection (0.01 to 0.10)
-    print("\n📦 SELECT LOT SIZE (0.01 - 0.10):")
+    # 4. Lot Size Selection (Choice Menu 1-10)
+    print("\n📦 SELECT LOT SIZE:")
+    lot_choices = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10]
+    for i, size in enumerate(lot_choices, 1):
+        print(f"{i}. {size}")
+    
     lot_size = 0.01
     while True:
         try:
-            val = input("Enter Lot Size (e.g. 0.01, 0.05, 0.10) [Default 0.01]: ").strip()
-            if not val:
+            choice = input(f"Choice (1-10) [Default 1]: ").strip()
+            if not choice:
                 lot_size = 0.01
                 break
-            f_val = float(val)
-            if 0.01 <= f_val <= 0.10:
-                lot_size = f_val
+            idx = int(choice)
+            if 1 <= idx <= 10:
+                lot_size = lot_choices[idx-1]
                 # Update config.yaml
                 try:
                     with open('config.yaml', 'r') as f:
@@ -1518,7 +1478,7 @@ def select_trade_setup():
                     logger.error(f"Failed to update config.yaml: {e}")
                 break
         except: pass
-        print("Invalid choice. Please enter a value between 0.01 and 0.10.")
+        print("Invalid choice. Please enter 1-10.")
 
     return ["XAUUSDm"], strategy, timeframe, profit_pct, profit_usd, trailing_enabled, recycler_profit_usd, lot_size
 

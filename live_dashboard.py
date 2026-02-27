@@ -39,8 +39,6 @@ class LivePortfolioDashboard:
         self.accumulated_seconds = self._load_session_stats()
         self.start_time = time.time()
         self._create_widgets()
-        
-        
         # Start background update thread
         self.update_thread = threading.Thread(target=self._update_loop, daemon=True)
         self.update_thread.start()
@@ -68,7 +66,6 @@ class LivePortfolioDashboard:
             with open(self.session_stats_file, 'w') as f:
                 json.dump({'accumulated_seconds': total}, f)
         except Exception: pass
-
     def _setup_styles(self):
         self.style.configure("TFrame", background="#0a0a0a")
         self.style.configure("Card.TFrame", background="#151515", relief="flat", borderwidth=0)
@@ -215,7 +212,8 @@ class LivePortfolioDashboard:
             with open(signal_file, 'w') as f:
                 f.write(str(datetime.now().timestamp()))
         except Exception as e:
-            logger.error(f"Failed to write reset signal: {e}")
+            # logger not defined in this file, use print
+            print(f"Failed to write reset signal: {e}")
 
         reset_point = datetime.now().timestamp()
         reset_file = Path("logs/dashboard_reset.json")
@@ -231,7 +229,6 @@ class LivePortfolioDashboard:
         self._save_session_stats()
         
         messagebox.showinfo("Reset Successful", "Performance metrics and Session Timer have been reset.")
-
     def _generate_report(self):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         report_path = Path(f"logs/live_reports/dashboard_report_{timestamp}.json")
@@ -296,8 +293,6 @@ class LivePortfolioDashboard:
         """Dedicated high-frequency update for the session timer (1s refresh)"""
         if not self.running: return
         try:
-            # Calculated based on REAL TIME difference since startup
-            # This ensures it can NEVER run "fast" regardless of update frequency
             total_seconds = int(self.accumulated_seconds + (time.time() - self.start_time))
             
             d, r = divmod(total_seconds, 86400)
@@ -312,7 +307,6 @@ class LivePortfolioDashboard:
             self.cards['duration_val'].config(text=uptime_str)
         except Exception: pass
         self.root.after(1000, self._tick_timer)
-
     def _update_positions_tree(self, positions):
         # Selected items tracking if needed
         for i in self.pos_tree.get_children():
@@ -400,6 +394,14 @@ class LivePortfolioDashboard:
                 session_pnl = sum(h['profit'] for h in self.trade_history if (now - datetime.strptime(h['time'], '%Y-%m-%d %H:%M')).total_seconds() < 86400)
                 session_color = "#00e676" if session_pnl >= 0 else "#ff5252"
                 self.cards['session_val'].config(text=f"${session_pnl:,.2f}", fg=session_color)
+            else:
+                # Reset labels to zero/empty
+                self.metric_labels['total_trades'].config(text="0")
+                self.metric_labels['win_rate'].config(text="0.0%")
+                self.metric_labels['total_pnl'].config(text="$0.00", foreground="#ffffff")
+                self.metric_labels['profit_factor'].config(text="0.00")
+                self.metric_labels['max_drawdown'].config(text="0.00%")
+                self.cards['session_val'].config(text="$0.00", fg="#ffffff")
 
     def _on_closing(self):
         self.running = False
