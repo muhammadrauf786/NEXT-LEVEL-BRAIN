@@ -132,7 +132,8 @@ class LivePortfolioDashboard:
             ("FLOATING EQUITY", "equity_val", "#00e676"),
             ("SESSION PNL", "session_val", "#00e676"),
             ("MARGIN LEVEL", "margin_val", "#03a9f4"),
-            ("SESSION TIME", "duration_val", "#ffeb3b")
+            ("SESSION TIME", "duration_val", "#ffeb3b"),
+            ("EQUITY MILESTONE", "milestone_val", "#e91e63")
         ]
         
         for i, (label, key, color) in enumerate(items):
@@ -266,6 +267,20 @@ class LivePortfolioDashboard:
                 positions = mt5.positions_get()
                 self._update_positions_tree(positions)
                 self._update_full_history()
+
+                # 4. Milestone Progress Update
+                try:
+                    milestone_file = Path("logs/milestone_progress.json")
+                    if milestone_file.exists():
+                        with open(milestone_file, 'r') as f:
+                            data = json.load(f)
+                            prog = data.get('progress', 0.0)
+                            target = data.get('target_inc', 100.0)
+                            color = "#e91e63" if prog >= 0 else "#ff5252"
+                            self.cards['milestone_val'].config(text=f"${prog:,.2f} / ${target}", fg=color)
+                    else:
+                        self.cards['milestone_val'].config(text="$0.00 / $100")
+                except: pass
 
                 # Market Status Check (Visual Warning)
                 symbol = "XAUUSDm"
