@@ -871,7 +871,7 @@ class LiveTradingSystem:
             # Cleanup removed: User handles this manually via Choice 6
             try:
                 import subprocess
-                subprocess.Popen([sys.executable, "live_dashboard.py"], creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0)
+                subprocess.Popen([sys.executable, "live_dashboard.py"], creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
                 logger.info("🚀 Live Dashboard auto-opened.")
             except Exception as e:
                 logger.warning(f"Failed to auto-open dashboard: {e}")
@@ -1380,7 +1380,7 @@ def select_trade_setup():
         if choice == "4":
             print(" Opening Live Dashboard...")
             import subprocess
-            subprocess.Popen([sys.executable, "live_dashboard.py"], creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0)
+            subprocess.Popen([sys.executable, "live_dashboard.py"], creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
             print("✅ Dashboard launched. Continuing...")
             continue
         if choice == "5":
