@@ -274,12 +274,18 @@ class LivePortfolioDashboard:
                     if milestone_file.exists():
                         with open(milestone_file, 'r') as f:
                             data = json.load(f)
-                            prog = data.get('progress', 0.0)
-                            target = data.get('target_inc', 100.0)
-                            color = "#e91e63" if prog >= 0 else "#ff5252"
-                            self.cards['milestone_val'].config(text=f"${prog:,.2f} / ${target}", fg=color)
+                            # Staleness check: only show if data is fresh (within last 30 seconds)
+                            file_ts = data.get('timestamp', 0)
+                            is_fresh = (time.time() - file_ts) < 30
+                            if is_fresh:
+                                prog = data.get('progress', 0.0)
+                                target = data.get('target_inc', 100.0)
+                                color = "#e91e63" if prog >= 0 else "#ff5252"
+                                self.cards['milestone_val'].config(text=f"${prog:,.2f} / ${target:.0f}", fg=color)
+                            else:
+                                self.cards['milestone_val'].config(text="$0.00 / $100", fg="#e91e63")
                     else:
-                        self.cards['milestone_val'].config(text="$0.00 / $100")
+                        self.cards['milestone_val'].config(text="$0.00 / $100", fg="#e91e63")
                 except: pass
 
                 # Market Status Check (Visual Warning)
