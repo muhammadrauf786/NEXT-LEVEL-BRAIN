@@ -10,6 +10,7 @@ import numpy as np
 import MetaTrader5 as mt5
 from datetime import datetime, timedelta
 from pathlib import Path
+from smart_trailing import SmartTrailingHandler
 from loguru import logger
 import sys
 import yaml
@@ -33,7 +34,7 @@ class BacktestEngine:
     
     def __init__(self):
         self.trades = []
-        self.balance = 1000.0  # Starting balance
+        self.balance = 10000.0  # Starting balance (Updated to 10k default)
         self.equity_curve = []
         self.ai_memories = []
         # Tunable parameters (adjust to your preference)
@@ -66,23 +67,40 @@ class BacktestEngine:
         return False
 
     def get_historical_data(self, symbol: str, start_date: datetime, end_date: datetime, timeframe: str = "M5") -> pd.DataFrame:
-        """Get historical data from MT5"""
+        """Get historical data from MT5 with robust error handling"""
         try:
-            if not mt5.initialize():
-                logger.error("MT5 initialization failed")
+            symbol = symbol.strip()
+            import os
+            terminal_path = os.getenv("MT5_TERMINAL_PATH", r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe")
+            
+            if not mt5.initialize(path=terminal_path):
+                err = mt5.last_error()
+                logger.error(f"MT5 initialization failed with path {terminal_path}: {err}")
                 return pd.DataFrame()
             
+            # Ensure symbol is selected in MarketWatch
+            if not mt5.symbol_select(symbol, True):
+                err = mt5.last_error()
+                logger.error(f"Symbol '{symbol}' could not be selected/found: {err}")
+                mt5.shutdown()
+                return pd.DataFrame()
+
             # Map timeframe
             tf_map = {
-                "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
-                "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1
+                "M1": mt5.TIMEFRAME_M1, "M3": mt5.TIMEFRAME_M3, "M5": mt5.TIMEFRAME_M5, 
+                "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, 
+                "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1
             }
             
             timeframe_mt5 = tf_map.get(timeframe, mt5.TIMEFRAME_H1)
+            
+            logger.info(f"⏳ Fetching {timeframe} data for {symbol} from {start_date} to {end_date}...")
             rates = mt5.copy_rates_range(symbol, timeframe_mt5, start_date, end_date)
             
             if rates is None or len(rates) == 0:
-                logger.warning(f"No historical data for {symbol}")
+                err = mt5.last_error()
+                logger.warning(f"No historical data for {symbol}. MT5 Error: {err}")
+                mt5.shutdown()
                 return pd.DataFrame()
             
             df = pd.DataFrame(rates)
@@ -93,10 +111,13 @@ class BacktestEngine:
             df = self.add_indicators(df)
             
             mt5.shutdown()
+            logger.info(f"✅ Successfully loaded {len(df)} bars for {symbol}")
             return df
             
         except Exception as e:
             logger.error(f"Error getting historical data: {e}")
+            try: mt5.shutdown()
+            except: pass
             return pd.DataFrame()
     
     def add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -533,6 +554,124 @@ class BacktestEngine:
         
         return max(0.01, position_size)
     
+    def run_grid_backtest(self, symbol: str, start_date: datetime, end_date: datetime, timeframe: str = "M5", mode: str = "BOTH", trailing_enabled: bool = True) -> Dict:
+        """Run grid strategy backtest with mode: BOTH, BUY_ONLY, SELL_ONLY"""
+        try:
+            strategy_name = "SMART TRAILING 10-20" if trailing_enabled else "GRID STANDARD"
+            logger.info(f"🕸️ Running Grid Backtest ({mode}) for {symbol} | Strategy: {strategy_name}")
+            data = self.get_historical_data(symbol, start_date, end_date, timeframe)
+            if data.empty: return {'error': 'No data'}
+
+            # Use existing balance if available
+            initial_balance = getattr(self, 'balance', 100000.0)
+            if initial_balance == 0: initial_balance = 100000.0
+            
+            self.balance = initial_balance
+            self.trades = []
+            self.equity_curve = [self.balance]
+            
+            pending_orders = []
+            open_positions = []
+            
+            # Trailing Handler
+            trail_handler = SmartTrailingHandler()
+            trail_handler.reset('BOTH')
+
+            # Use settings from config if possible, else defaults
+            try:
+                import yaml
+                with open('config.yaml', 'r') as f:
+                    config = yaml.safe_load(f)
+                grid_cfg = config.get('grid', {})
+                grid_size = grid_cfg.get('size', 300)
+                spacing = grid_cfg.get('spacing', 1.0)
+                lot_size = grid_cfg.get('lot_size', 0.01)
+            except:
+                grid_size = 300
+                spacing = 1.0
+                lot_size = 0.01
+
+            logger.info(f"⚙️ Grid Config: Size={grid_size}, Spacing={spacing}, Lot={lot_size}")
+            if trailing_enabled:
+                logger.info(f"🛡️ Smart Trailing Enabled ($10-$20) - Separate BUY/SELL")
+
+            for i in range(50, len(data)):
+                current_bar = data.iloc[i]
+                current_time = data.index[i]
+                
+                # 1. Total Grid Profit Check
+                buy_pos = [p for p in open_positions if p['type'] == 'BUY']
+                sell_pos = [p for p in open_positions if p['type'] == 'SELL']
+                
+                buy_profit = sum(self._calculate_floating_pnl(p, current_bar['close'], symbol) for p in buy_pos)
+                sell_profit = sum(self._calculate_floating_pnl(p, current_bar['close'], symbol) for p in sell_pos)
+                
+                # Smart Trailing Logic (Separate BUY and SELL)
+                if trailing_enabled:
+                    # BUY Trailing
+                    if buy_pos:
+                        if trail_handler.check_profit('BUY', buy_profit) == 'CLOSE':
+                            for p in buy_pos:
+                                trade = self._close_position(p, current_bar['close'], current_time, 'Smart TP (BUY)')
+                                self.trades.append(trade)
+                                self.balance += trade['pnl']
+                            open_positions = [p for p in open_positions if p['type'] != 'BUY']
+                            pending_orders = [o for o in pending_orders if o['type'] != 'BUY']
+                            self.equity_curve.append(self.balance)
+
+                    # SELL Trailing
+                    if sell_pos:
+                        if trail_handler.check_profit('SELL', sell_profit) == 'CLOSE':
+                            for p in sell_pos:
+                                trade = self._close_position(p, current_bar['close'], current_time, 'Smart TP (SELL)')
+                                self.trades.append(trade)
+                                self.balance += trade['pnl']
+                            open_positions = [p for p in open_positions if p['type'] != 'SELL']
+                            pending_orders = [o for o in pending_orders if o['type'] != 'SELL']
+                            self.equity_curve.append(self.balance)
+
+                # 2. Check pending hits
+                for order in pending_orders[:]:
+                    if (order['type'] == 'BUY' and current_bar['low'] <= order['price']) or \
+                       (order['type'] == 'SELL' and current_bar['high'] >= order['price']):
+                        order['entry_time'] = current_time
+                        order['entry_price'] = order['price']
+                        open_positions.append(order)
+                        pending_orders.remove(order)
+
+                # 3. Check bias and grid placement
+                bias = self._determine_market_bias(data, i)
+                
+                if mode in ['BOTH', 'SELL_ONLY']:
+                    if bias == 'BULLISH' and not any(o['type'] == 'SELL' for o in pending_orders) and not any(p['type'] == 'SELL' for p in open_positions):
+                        logger.info(f"🚀 Placing SELL grid at {current_time} (Price: {current_bar['close']})")
+                        for j in range(1, grid_size + 1):
+                            pending_orders.append({'type': 'SELL', 'price': current_bar['close'] + (j * spacing), 'position_size': lot_size, 'symbol': symbol})
+                
+                if mode in ['BOTH', 'BUY_ONLY']:
+                    if bias == 'BEARISH' and not any(o['type'] == 'BUY' for o in pending_orders) and not any(p['type'] == 'BUY' for p in open_positions):
+                        logger.info(f"🚀 Placing BUY grid at {current_time} (Price: {current_bar['close']})")
+                        for j in range(1, grid_size + 1):
+                            pending_orders.append({'type': 'BUY', 'price': current_bar['close'] - (j * spacing), 'position_size': lot_size, 'symbol': symbol})
+
+                if i % 100 == 0:
+                    current_equity = self.balance + buy_profit + sell_profit
+                    self.equity_curve.append(current_equity)
+
+            # 4. Force close all remaining positions at end of backtest
+            if open_positions:
+                logger.info(f"🏁 Closing {len(open_positions)} remaining positions at end of backtest")
+                for p in open_positions:
+                    trade = self._close_position(p, data.iloc[-1]['close'], data.index[-1], 'End of Backtest')
+                    self.trades.append(trade)
+                    self.balance += trade['pnl']
+            
+            self.equity_curve.append(self.balance)
+            return self._calculate_performance_metrics(symbol)
+        except Exception as e:
+            logger.error(f"Grid backtest error: {e}")
+            return {'error': str(e)}
+
     def run_backtest(self, symbol: str, start_date: datetime, end_date: datetime, timeframe: str = "M5") -> Dict:
         """Run backtest on historical data"""
         try:
@@ -550,7 +689,7 @@ class BacktestEngine:
             logger.info(f"🎯 Target Silver Bullet Hours: [3, 10, 14]")
             
             # Initialize backtest variables
-            self.balance = 10000.0
+            self.balance = 100000.0
             self.trades = []
             self.equity_curve = [self.balance]
             position = None
@@ -624,7 +763,7 @@ class BacktestEngine:
                         exit_reason = 'Take Profit'
                         exit_triggered = True
                     
-                    # Time-based exit (hold for max 24 bars)
+                    # Time-based exit (hold for max 72 hours)
                     elif (current_time - position['entry_time']).total_seconds() / 3600 > 72:
                         exit_triggered = True
                     
@@ -687,6 +826,25 @@ class BacktestEngine:
         except:
             return 0.01
     
+    def _calculate_floating_pnl(self, position: Dict, current_price: float, symbol: str) -> float:
+        """Calculate floating P&L for a position"""
+        try:
+            entry_price = position['entry_price']
+            position_size = position['position_size']
+            
+            price_diff = current_price - entry_price if position['type'] == 'BUY' else entry_price - current_price
+            
+            if 'BTC' in symbol or 'ETH' in symbol:
+                pnl = price_diff * position_size
+            elif 'XAU' in symbol or 'XAG' in symbol:
+                pnl = price_diff * position_size * 100
+            else:
+                pnl = price_diff * position_size * 100000
+                
+            return pnl
+        except:
+            return 0.0
+
     def _close_position(self, position: Dict, exit_price: float, exit_time: datetime, exit_reason: str) -> Dict:
         """Close position and calculate P&L"""
         try:
@@ -716,14 +874,140 @@ class BacktestEngine:
                 'position_size': position_size,
                 'pnl': pnl,
                 'exit_reason': exit_reason,
-                'duration': (exit_time - position['entry_time']).total_seconds() / 3600,
-                'confidence': position['confidence']
+                'duration': (exit_time - position['entry_time']).total_seconds() / 3600 if 'entry_time' in position else 0,
+                'confidence': position.get('confidence', 1.0)
             }
             
         except Exception as e:
             logger.error(f"Position close error: {e}")
             return {}
     
+    def run_recycler_backtest(self, symbol: str, start_date: datetime, end_date: datetime,
+                               timeframe: str = "M5", mode: str = "BOTH",
+                               per_trade_profit: float = 1.0, spacing: float = 1.0,
+                               lot_size: float = 0.01, levels: int = 300) -> Dict:
+        """
+        Backtest the Grid Recycler strategy with precise batch control and level recycling.
+        - Batch size: 20
+        - Next batch trigger: 15 active trades
+        - Re-entry: Same price level immediately after trailing close
+        """
+        try:
+            logger.info(f"🔄 Running Grid Recycler Backtest ({mode}) for {symbol}")
+            data = self.get_historical_data(symbol, start_date, end_date, timeframe)
+            if data.empty:
+                return {'error': 'No historical data available'}
+
+            self.balance = 10000.0
+            self.trades = []
+            self.equity_curve = [self.balance]
+
+            batch_size = 20
+            trigger_threshold = 5
+            total_target = 5000  # Infinite
+            
+            # Tracking state per symbol/side: price -> {'side': str, 'pos': Optional[dict]}
+            active_levels = {} 
+            
+            # Bi-directional tracking: first_idx (rolling), last_idx (expansion)
+            state = {
+                'BUY': {'base': data['open'].iloc[0], 'first': 0, 'last': 0},
+                'SELL': {'base': data['open'].iloc[0], 'first': 0, 'last': 0}
+            }
+
+            def expand_depth(side):
+                s = state[side]
+                num = batch_size
+                for _ in range(num):
+                    s['last'] += 1
+                    price = round(s['base'] - (s['last'] * spacing), 2) if side == 'BUY' else round(s['base'] + (s['last'] * spacing), 2)
+                    if price not in active_levels:
+                        active_levels[price] = {'side': side, 'pos': None}
+
+            def roll_front(side, current_p):
+                # Add level one-by-one until gap is covered
+                s = state[side]
+                while True:
+                    front_p = s['base'] - ((s['first'] + 1) * spacing) if side == 'BUY' else s['base'] + ((s['first'] + 1) * spacing)
+                    # For BUY, if market > front_p + gap
+                    # For SELL, if market < front_p - gap
+                    gap_trigger = spacing * 1.01
+                    if (side == 'BUY' and current_p > front_p + gap_trigger) or (side == 'SELL' and current_p < front_p - gap_trigger):
+                        # Roll
+                        entry_p = round(s['base'] - (s['first'] * spacing), 2) if side == 'BUY' else round(s['base'] + (s['first'] * spacing), 2)
+                        if entry_p not in active_levels:
+                            active_levels[entry_p] = {'side': side, 'pos': None}
+                        s['first'] -= 1
+                    else:
+                        break
+
+            # Initial setup
+            for side in (['BUY', 'SELL'] if mode == 'BOTH' else [mode.replace('_ONLY', '')]):
+                expand_depth(side)
+
+            for i in range(1, len(data)):
+                bar = data.iloc[i]
+                bar_time = data.index[i]
+                high, low, close = bar['high'], bar['low'], bar['close']
+
+                # 1. Rolling: Follow market movement
+                for side in (['BUY', 'SELL'] if mode == 'BOTH' else [mode.replace('_ONLY', '')]):
+                    roll_front(side, close)
+
+                # 2. Check Order Activation & Trailing
+                for price, info in list(active_levels.items()):
+                    side = info['side']
+                    pos = info['pos']
+
+                    if pos is None:
+                        # Activate Pending
+                        if (side == 'BUY' and low <= price) or (side == 'SELL' and high >= price):
+                            info['pos'] = {'entry_price': price, 'entry_time': bar_time, 'peak_pnl': 0.0, 'lock': 0.0}
+                    else:
+                        # Trailing logic
+                        entry = pos['entry_price']
+                        pnl = (close - entry) * lot_size * 100 if side == 'BUY' else (entry - close) * lot_size * 100
+                        if pnl > pos['peak_pnl']: pos['peak_pnl'] = pnl
+                        
+                        # Apply locking levels
+                        for threshold, lock_val in [(per_trade_profit, per_trade_profit*0.5), (1.5, 1.0), (2.0, 1.5), (5.0, 3.5), (10.0, 7.5), (20.0, 16.5)]:
+                            if pnl >= threshold and lock_val > pos['lock']: pos['lock'] = lock_val
+                        if pnl >= 25.0:
+                            floating = pos['peak_pnl'] * 0.8
+                            if floating > pos['lock']: pos['lock'] = floating
+
+                        # Exit
+                        if pos['lock'] > 0 and pnl < pos['lock'] - 0.1: # Small buffer
+                            exit_pnl = max(pos['lock'], pnl)
+                            self.balance += exit_pnl
+                            self.trades.append({
+                                'entry_time': pos['entry_time'], 'exit_time': bar_time, 'type': side,
+                                'entry_price': entry, 'exit_price': close, 'pnl': exit_pnl, 'exit_reason': 'Dynamic Trail'
+                            })
+                            info['pos'] = None # Level recycled automatically (pos is None means back to Pending)
+
+                # 3. Expansion: Maintain depth
+                for side in (['BUY', 'SELL'] if mode == 'BOTH' else [mode.replace('_ONLY', '')]):
+                    side_pendings = [p for p, inf in active_levels.items() if inf['side'] == side and inf['pos'] is None]
+                    if len(side_pendings) <= trigger_threshold:
+                        expand_depth(side)
+
+                if i % 100 == 0:
+                    self.equity_curve.append(self.balance)
+
+            self.equity_curve.append(self.balance)
+            return self._calculate_performance_metrics(symbol)
+
+        except Exception as e:
+            logger.error(f"Recycler backtest error: {e}")
+            import traceback
+            traceback.print_exc()
+        except Exception as e:
+            logger.error(f"Recycler backtest error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {'error': str(e)}
+
     def _calculate_performance_metrics(self, symbol: str) -> Dict:
         """Calculate backtest performance metrics"""
         try:
@@ -769,7 +1053,8 @@ class BacktestEngine:
                 'max_drawdown': max_drawdown,
                 'sharpe_ratio': sharpe_ratio,
                 'final_balance': self.balance,
-                'return_pct': (self.balance - 10000) / 10000,
+                'initial_balance': self.equity_curve[0] if self.equity_curve else self.balance,
+                'return_pct': (self.balance - self.equity_curve[0]) / self.equity_curve[0] if self.equity_curve and self.equity_curve[0] > 0 else 0,
                 'trades': self.trades
             }
             
@@ -983,9 +1268,11 @@ class TradingDashboard:
         self.root.configure(bg='#2b2b2b')
         
         # Variables
-        self.selected_symbol = tk.StringVar(value="BTCUSDm")
+        self.selected_symbol = tk.StringVar(value="XAUUSDm")
         self.selected_timeframe = tk.StringVar(value="M5")
         self.selected_period = tk.StringVar(value="30")
+        self.selected_strategy = tk.StringVar(value="ICT SMC")
+        self.selected_balance = tk.DoubleVar(value=10000.0)
         self.backtest_engine = BacktestEngine()
         self.current_results = None
         
@@ -1009,27 +1296,46 @@ class TradingDashboard:
         # Symbol selection
         ttk.Label(control_frame, text="Symbol:").grid(row=0, column=0, padx=5)
         symbol_combo = ttk.Combobox(control_frame, textvariable=self.selected_symbol, 
-                                   values=["BTCUSDm", "ETHUSDm", "XAUUSDm", "XAGUSDm", 
-                                          "EURUSDm", "GBPUSDm", "USDJPYm"])
+                                   values=["XAUUSDm"])
         symbol_combo.grid(row=0, column=1, padx=5)
         
         # Timeframe selection
         ttk.Label(control_frame, text="Timeframe:").grid(row=0, column=2, padx=5)
         timeframe_combo = ttk.Combobox(control_frame, textvariable=self.selected_timeframe,
-                                      values=["M1", "M5", "M15", "H1", "H4", "D1"])
+                                      values=["M1", "M3", "M5", "M15", "M30", "H1", "H4", "D1"])
         timeframe_combo.grid(row=0, column=3, padx=5)
         
-        # Period selection
         ttk.Label(control_frame, text="Period (days):").grid(row=0, column=4, padx=5)
         period_combo = ttk.Combobox(control_frame, textvariable=self.selected_period,
                                    values=["7", "30", "90", "180", "365"])
         period_combo.grid(row=0, column=5, padx=5)
+
+        # Initial Balance selection
+        ttk.Label(control_frame, text="Balance ($):").grid(row=0, column=6, padx=5)
+        balance_values = [str(x) for x in range(1000, 11000, 1000)]
+        balance_combo = ttk.Combobox(control_frame, textvariable=self.selected_balance,
+                                    values=balance_values, width=8)
+        balance_combo.grid(row=0, column=7, padx=5)
+        
+        # Strategy selection
+        ttk.Label(control_frame, text="Strategy:").grid(row=0, column=8, padx=5)
+        strategy_combo = ttk.Combobox(control_frame, textvariable=self.selected_strategy,
+                                      values=[
+                                          "ICT SMC",
+                                          "Smart Trailing (Both)",
+                                          "Smart Trailing BUY ONLY",
+                                          "Smart Trailing SELL ONLY",
+                                          "Grid Recycler BUY ONLY",
+                                          "Grid Recycler SELL ONLY",
+                                          "Grid Recycler Both",
+                                      ])
+        strategy_combo.grid(row=0, column=9, padx=5)
         
         # Buttons
         ttk.Button(control_frame, text="🚀 Run Backtest", 
-                  command=self.run_backtest_gui).grid(row=0, column=6, padx=10)
+                  command=self.run_backtest_gui).grid(row=0, column=10, padx=10)
         ttk.Button(control_frame, text="📊 Show Chart", 
-                  command=self.show_chart).grid(row=0, column=7, padx=5)
+                  command=self.show_chart).grid(row=0, column=11, padx=5)
         
         # Results Frame
         results_frame = ttk.LabelFrame(main_frame, text="Backtest Results", padding="10")
@@ -1098,8 +1404,28 @@ class TradingDashboard:
                 end_date = datetime.now()
                 start_date = end_date - timedelta(days=days)
                 
-                # Run backtest with specified timeframe
-                results = self.backtest_engine.run_backtest(symbol, start_date, end_date, timeframe)
+                # Check strategy selection
+                strategy = self.selected_strategy.get()
+                
+                # Run backtest with specified timeframe and strategy
+                self.backtest_engine.balance = self.selected_balance.get()
+                # Removed profit_target_pct as we are shifting to USD/Trailing targets
+                
+                if strategy == "Smart Trailing (Both)":
+                    results = self.backtest_engine.run_grid_backtest(symbol, start_date, end_date, timeframe, mode="BOTH", trailing_enabled=True)
+                elif strategy == "Smart Trailing BUY ONLY":
+                    results = self.backtest_engine.run_grid_backtest(symbol, start_date, end_date, timeframe, mode="BUY_ONLY", trailing_enabled=True)
+                elif strategy == "Smart Trailing SELL ONLY":
+                    results = self.backtest_engine.run_grid_backtest(symbol, start_date, end_date, timeframe, mode="SELL_ONLY", trailing_enabled=True)
+                elif strategy == "Grid Recycler BUY ONLY":
+                    results = self.backtest_engine.run_recycler_backtest(symbol, start_date, end_date, timeframe, mode="BUY_ONLY")
+                elif strategy == "Grid Recycler SELL ONLY":
+                    results = self.backtest_engine.run_recycler_backtest(symbol, start_date, end_date, timeframe, mode="SELL_ONLY")
+                elif strategy == "Grid Recycler Both":
+                    results = self.backtest_engine.run_recycler_backtest(symbol, start_date, end_date, timeframe, mode="BOTH")
+                else:
+                    results = self.backtest_engine.run_backtest(symbol, start_date, end_date, timeframe)
+                
                 self.current_results = results
                 
                 if 'error' not in results:

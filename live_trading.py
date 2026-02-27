@@ -19,7 +19,12 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 import os
+import json
 from dotenv import load_dotenv
+from smart_trailing import SmartTrailingHandler
+from grid_recycler import GridRecycler
+from mt5_broker import MT5Broker
+from profit_controller import ProfitController
 
 # Load environment variables
 load_dotenv()
@@ -48,15 +53,17 @@ class TradingBrain:
             if report_file.exists():
                 with open(report_file, 'r') as f:
                     content = f.read()
-                    if "DECISION:           BLOCK" in content:
-                        self.sentiment_decision = "BLOCK"
-                    elif "DECISION:           REDUCE" in content:
-                        self.sentiment_decision = "REDUCE"
-                        self.risk_modifier = 0.5
-                    else:
-                        self.sentiment_decision = "ALLOW"
-                        self.risk_modifier = 1.0
-                logger.info(f"📡 Market Intelligence: {self.sentiment_decision}")
+                    if content != getattr(self, '_last_sentiment_content', ''):
+                        if "DECISION:           BLOCK" in content:
+                            self.sentiment_decision = "BLOCK"
+                        elif "DECISION:           REDUCE" in content:
+                            self.sentiment_decision = "REDUCE"
+                            self.risk_modifier = 0.5
+                        else:
+                            self.sentiment_decision = "ALLOW"
+                            self.risk_modifier = 1.0
+                        logger.info(f"📡 Market Intelligence: {self.sentiment_decision}")
+                        self._last_sentiment_content = content
             else:
                 logger.warning("📡 No intelligence report found. Defaulting to ALLOW.")
         except Exception as e:
@@ -97,27 +104,30 @@ class TradingBrain:
     def analyze_market(self, symbol: str, data: pd.DataFrame) -> Dict:
         """ICT/SMC AI market analysis"""
         try:
-            # Update sentiment from file regularly
-            self._check_sentiment_bias()
-            
-            if self.sentiment_decision == "BLOCK":
-                return {'action': 'HOLD', 'confidence': 0.0, 'reasoning': 'Intelligence Engine Decision: BLOCK'}
-
-            current_time = datetime.now()
-            if not self._is_silver_bullet_time(current_time):
-                 return {'action': 'HOLD', 'confidence': 0.0, 'reasoning': 'Outside Silver Bullet Windows (3-4, 10-11, 14-15)'}
-            
             if len(data) < 50:
-                return {'action': 'HOLD', 'confidence': 0.0, 'reasoning': 'Insufficient data'}
+                return {'action': 'HOLD', 'bias': 'NEUTRAL', 'confidence': 0.0, 'reasoning': 'Insufficient data'}
             
             # Add technical indicators
             data = self._add_indicators(data)
             index = len(data) - 1  # Current bar index
             
-            # Get market structure analysis
+            # ALWAYS determine market bias for systems like Grid
             market_bias = self._determine_market_bias(data, index)
-            if market_bias == 'NEUTRAL':
-                return {'action': 'HOLD', 'confidence': 0.0, 'reasoning': 'No clear market bias'}
+            
+            # Check Silver Bullet Time (Only blocks ICT execution, not bias detection)
+            current_time = datetime.now()
+            is_sb_time = self._is_silver_bullet_time(current_time)
+            
+            # Update sentiment from file regularly
+            self._check_sentiment_bias()
+            
+            if self.sentiment_decision == "BLOCK":
+                return {'action': 'HOLD', 'bias': market_bias, 'confidence': 0.0, 'reasoning': 'Intelligence Engine Decision: BLOCK'}
+
+            # ICT Signal filtering
+            if not is_sb_time:
+                 # We still return the bias so Grid can work, but signal is HOLD for ICT
+                 return {'action': 'HOLD', 'bias': market_bias, 'confidence': 0.0, 'reasoning': 'Outside Silver Bullet Windows'}
             
             # Check for liquidity sweeps
             liquidity_sweep = self._detect_liquidity_sweep(data, index)
@@ -177,12 +187,14 @@ class TradingBrain:
                     
                     return {
                         'action': 'BUY',
+                        'bias': 'BULLISH',
                         'confidence': confidence,
                         'reasoning': f'ICT Bullish: {", ".join(signals_present)} (Score: {bullish_conditions:.1f})',
                         'entry_price': current['close'],
                         'stop_loss': stop_loss,
                         'take_profit': self._find_next_liquidity_pool(data, index, 'UP')
                     }
+                return {'action': 'HOLD', 'bias': 'BULLISH', 'confidence': 0.0, 'reasoning': 'ICT conditions not aligned'}
             
             # BEARISH SETUP - Need at least 2 of 3 main signals
             elif market_bias == 'BEARISH':
@@ -209,18 +221,20 @@ class TradingBrain:
                     
                     return {
                         'action': 'SELL',
+                        'bias': 'BEARISH',
                         'confidence': confidence,
                         'reasoning': f'ICT Bearish: {", ".join(signals_present)} (Score: {bearish_conditions:.1f})',
                         'entry_price': current['close'],
                         'stop_loss': stop_loss,
                         'take_profit': self._find_next_liquidity_pool(data, index, 'DOWN')
                     }
+                return {'action': 'HOLD', 'bias': 'BEARISH', 'confidence': 0.0, 'reasoning': 'ICT conditions not aligned'}
             
-            return {'action': 'HOLD', 'confidence': 0.0, 'reasoning': 'ICT conditions not fully aligned'}
+            return {'action': 'HOLD', 'bias': 'NEUTRAL', 'confidence': 0.0, 'reasoning': 'ICT conditions not fully aligned'}
                 
         except Exception as e:
             logger.error(f"ICT AI analysis error: {e}")
-            return {'action': 'HOLD', 'confidence': 0.0, 'reasoning': 'Analysis failed'}
+            return {'action': 'HOLD', 'bias': 'NEUTRAL', 'confidence': 0.0, 'reasoning': 'Analysis failed'}
     
     def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> float:
         """Calculate RSI indicator"""
@@ -491,163 +505,6 @@ class ICTAnalyzer:
             logger.error(f"Order block detection error: {e}")
             return []
 
-class MT5Broker:
-    """MetaTrader 5 Broker Interface"""
-    
-    def __init__(self, config: Dict):
-        self.config = config
-        self.connected = False
-        
-    async def connect(self) -> bool:
-        """Connect to MT5 with robust retries and session clearing"""
-        try:
-            # Force close any hung sessions first
-            mt5.shutdown()
-            await asyncio.sleep(1)
-            
-            terminal_path = r"C:\Program Files\MetaTrader 5 EXNESS\terminal64.exe"
-            
-            success = False
-            for i in range(3):
-                logger.info(f"Connecting to MT5 (Attempt {i+1}/3)...")
-                if mt5.initialize(path=terminal_path):
-                    success = True
-                    break
-                logger.warning(f"Connection attempt {i+1} failed: {mt5.last_error()}")
-                await asyncio.sleep(2)
-                
-            if not success:
-                logger.error(f"MT5 could not be initialized after 3 attempts: {mt5.last_error()}")
-                return False
-                
-            # Login with credentials
-            login = self.config.get('login') or int(os.getenv('MT5_LOGIN', 0))
-            password = self.config.get('password') or os.getenv('MT5_PASSWORD')
-            server = self.config.get('server') or os.getenv('MT5_SERVER')
-            
-            logger.info(f"Logging into {server} (Account: {login})...")
-            if login and password and server:
-                if not mt5.login(login, password=password, server=server):
-                    logger.error(f"MT5 login failed: {mt5.last_error()}")
-                    # Fail-safe: Check if we are already logged in to this account
-                    acc = mt5.account_info()
-                    if acc and acc.login == login:
-                        logger.info("Terminal is already logged into the correct account manually. Proceeding.")
-                    else:
-                        return False
-            
-            self.connected = True
-            account_info = mt5.account_info()
-            if account_info:
-                logger.info(f"Connected to MT5 - Balance: ${account_info.balance:.2f}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"MT5 connection error: {e}")
-            return False
-    
-    def get_market_data(self, symbol: str, timeframe: str = "M5", count: int = 500) -> pd.DataFrame:
-        """Get market data from MT5"""
-        try:
-            # Map timeframe
-            tf_map = {
-                "M1": mt5.TIMEFRAME_M1,
-                "M5": mt5.TIMEFRAME_M5,
-                "M15": mt5.TIMEFRAME_M15,
-                "H1": mt5.TIMEFRAME_H1,
-                "H4": mt5.TIMEFRAME_H4,
-                "D1": mt5.TIMEFRAME_D1
-            }
-            
-            timeframe_mt5 = tf_map.get(timeframe, mt5.TIMEFRAME_H1)
-            rates = mt5.copy_rates_from_pos(symbol, timeframe_mt5, 0, count)
-            
-            if rates is None or len(rates) == 0:
-                logger.warning(f"No data received for {symbol}")
-                return pd.DataFrame()
-                
-            df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-            df.set_index('time', inplace=True)
-            
-            return df
-            
-        except Exception as e:
-            logger.error(f"Error getting market data: {e}")
-            return pd.DataFrame()
-    
-    def place_order(self, symbol: str, action: str, volume: float, price: float, 
-                   stop_loss: float = None, take_profit: float = None) -> Dict:
-        """Place trading order"""
-        try:
-            # Get symbol info
-            symbol_info = mt5.symbol_info(symbol)
-            if not symbol_info:
-                return {'success': False, 'error': f'Symbol {symbol} not found'}
-            
-            # Prepare order request
-            order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
-            
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": volume,
-                "type": order_type,
-                "price": price,
-                "deviation": 20,
-                "magic": 234000,
-                "comment": "NEXT_LEVEL_BRAIN",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-            
-            if stop_loss:
-                request["sl"] = stop_loss
-            if take_profit:
-                request["tp"] = take_profit
-            
-            # Send order
-            result = mt5.order_send(request)
-            
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                return {'success': False, 'error': f'Order failed: {result.retcode}'}
-            
-            logger.info(f"Order placed: {action} {volume} {symbol} at {price}")
-            return {
-                'success': True,
-                'ticket': result.order,
-                'price': result.price,
-                'volume': result.volume
-            }
-            
-        except Exception as e:
-            logger.error(f"Order placement error: {e}")
-            return {'success': False, 'error': str(e)}
-    
-    def get_positions(self) -> List[Dict]:
-        """Get open positions"""
-        try:
-            positions = mt5.positions_get()
-            if not positions:
-                return []
-                
-            return [
-                {
-                    'ticket': pos.ticket,
-                    'symbol': pos.symbol,
-                    'type': 'BUY' if pos.type == mt5.POSITION_TYPE_BUY else 'SELL',
-                    'volume': pos.volume,
-                    'price_open': pos.price_open,
-                    'price_current': pos.price_current,
-                    'profit': pos.profit,
-                    'time': datetime.fromtimestamp(pos.time)
-                }
-                for pos in positions
-            ]
-            
-        except Exception as e:
-            logger.error(f"Error getting positions: {e}")
-            return []
 
 class RiskManager:
     """Risk Management System"""
@@ -705,6 +562,287 @@ class RiskManager:
             
         return True
 
+class GridManager:
+    """Manages User Requested Grid Strategy"""
+    def __init__(self, broker, config: Dict = None):
+        self.broker = broker
+        grid_config = (config or {}).get('grid', {})
+        
+        self.magic_buy = 777001
+        self.magic_sell = 777002
+        self.grid_size = grid_config.get('size', 300)
+        self.spacing = grid_config.get('spacing', 1.0)  # Spacing in $
+        self.lot_size = grid_config.get('lot_size', 0.01)
+        self.per_trade_profit = 1.0                     # $ profit per trade target
+        self.mode = grid_config.get('mode', 'BOTH') 
+        self.active_grids = {} # symbol -> {'BUY/SELL': {'base_price': float, 'first_index': int, 'last_index': int}}
+        self.batch_size = 20
+        self.trigger_threshold = 5
+        self.total_target = 5000                             # Infinite Grid target
+        self.strategy_name = "GRID DYNAMIC"
+        
+        # Profit Controller integration
+        self.profit_ctrl = ProfitController(broker, self.strategy_name)
+        
+        # State Persistence
+        self.state_file = Path("logs/grid_state.json")
+        self._load_state()
+
+    def _save_state(self):
+        """Save grid progress to file"""
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.state_file, 'w') as f:
+                json.dump(self.active_grids, f)
+        except Exception as e:
+            logger.error(f"Error saving grid state: {e}")
+
+    def _load_state(self):
+        """Load grid progress from file"""
+        if self.state_file.exists():
+            try:
+                with open(self.state_file, 'r') as f:
+                    self.active_grids = json.load(f)
+                    
+                    # Migration: If old state had 'type' at top level for a symbol, wrap it
+                    for symbol in list(self.active_grids.keys()):
+                        data = self.active_grids[symbol]
+                        if 'type' in data: # Check for old structure
+                            side = data['type']
+                            # Remove 'type' key if it's not needed in the new nested structure
+                            # For now, just wrap it. The 'type' key inside the nested dict is redundant
+                            # but harmless if not explicitly used.
+                            del data['type'] # Remove the top-level 'type'
+                            self.active_grids[symbol] = {side: data}
+                            logger.info(f"🚚 Migrated legacy grid state for {symbol} ({side})")
+                logger.info(f"📁 Loaded Grid State from {self.state_file}")
+            except json.JSONDecodeError:
+                logger.warning("⚠️ Grid state file was corrupt. Starting fresh.")
+                self.active_grids = {}
+            except Exception as e:
+                logger.error(f"Failed to load grid state: {e}")
+                self.active_grids = {}
+        else:
+            self.active_grids = {}
+
+    async def _close_all_grid(self, symbol):
+        """Helper to close all grid orders and clear state"""
+        await self._close_all_grid_side(symbol, mt5.ORDER_TYPE_BUY)
+        await self._close_all_grid_side(symbol, mt5.ORDER_TYPE_SELL)
+        await self.broker.cancel_all_pendings(symbol)
+        if symbol in self.active_grids:
+            del self.active_grids[symbol]
+        self._save_state()
+
+    async def _recycle_level(self, symbol: str, price: float, side_type: int):
+        """Immediately re-place a pending order at the level that just closed. Uses broker's built-in retry."""
+        try:
+            magic = self.magic_buy if side_type == mt5.POSITION_TYPE_BUY else self.magic_sell
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT if side_type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_SELL_LIMIT
+            
+            # Normalize price to tick size
+            symbol_info = mt5.symbol_info(symbol)
+            if symbol_info:
+                tick_size = getattr(symbol_info, 'trade_tick_size', 0.0)
+                if tick_size > 0:
+                    price = round(round(price / tick_size) * tick_size, symbol_info.digits)
+
+            side_str = 'BUY' if side_type == mt5.POSITION_TYPE_BUY else 'SELL'
+            
+            # Use broker's resilient place_pending_order (already has infinite retry)
+            res = await self.broker.place_pending_order(symbol, order_type, self.lot_size, price, magic)
+            
+            if res.get('success'):
+                logger.info(f"♻️ Level Recycled: {side_str} Limit replaced at {price:.3f}")
+            elif res.get('error') == 'MARKET_CLOSED':
+                logger.info(f"⏸️ Market Closed: Stopped recycling {side_str} at {price:.3f}")
+            else:
+                logger.warning(f"❌ Failed to recycle level at {price:.3f}: {res.get('error')}")
+
+        except Exception as e:
+            logger.error(f"Error recycling level: {e}")
+
+    async def _close_all_grid_side(self, symbol, side_type):
+        """Close only one side of the grid (BUY or SELL)"""
+        side_str = 'BUY' if side_type == mt5.ORDER_TYPE_BUY else 'SELL'
+        magic = self.magic_buy if side_type == mt5.ORDER_TYPE_BUY else self.magic_sell
+        
+        await self.broker.close_all_side(symbol, side_str, magic)
+        
+        # Side-specific pending cancellation
+        active_pendings = mt5.orders_get(symbol=symbol)
+        if active_pendings:
+            side_pendings = [o for o in active_pendings if o.magic == magic]
+            for o in side_pendings:
+                await self.broker.cancel_order(o.ticket)
+                
+        if symbol in self.active_grids and side_str in self.active_grids[symbol]:
+            del self.active_grids[symbol][side_str]
+            if not self.active_grids[symbol]: # If no sides left for symbol, remove symbol entry
+                del self.active_grids[symbol]
+        
+        self.profit_ctrl.reset(side_str)
+        self._save_state()
+
+    async def update(self, symbol, current_price, bias, balance):
+        """Update grid logic based on bias and profit"""
+        try:
+            symbol_info = mt5.symbol_info(symbol)
+            if not symbol_info:
+                logger.error(f"Cannot update grid: Symbol {symbol} not found")
+                return
+
+            # 1. Update Grid Positions (Raw objects for ProfitController)
+            raw_positions = mt5.positions_get(symbol=symbol)
+            if raw_positions is None: raw_positions = []
+            grid_objs = [p for p in raw_positions if p.magic in (self.magic_buy, self.magic_sell)]
+
+            # 2. Individual Trailing Check via ProfitController
+            to_close = await self.profit_ctrl.monitor_individual_trailing(grid_objs, self.per_trade_profit)
+            
+            for pos in to_close:
+                logger.info(f"💰 Grid Trade {pos.ticket} closed via Individual Trailing.")
+                # Close the position
+                res = await self.broker.close_position(pos.ticket)
+                if res['success']:
+                    # Immediately recycle the level
+                    await self._recycle_level(symbol, pos.price_open, pos.type)
+
+            # 3. Batch Maintenance Logic
+            all_orders = mt5.orders_get(symbol=symbol)
+            if all_orders is None: all_orders = []
+            grid_pendings = [o for o in all_orders if o.magic in (self.magic_buy, self.magic_sell)]
+
+            # 3. Dynamic Grid Logic (SELL Side)
+            if self.mode in ('SELL_ONLY', 'BOTH'):
+                sell_pendings = [o for o in grid_pendings if o.magic == self.magic_sell]
+                sell_positions = [p for p in grid_objs if p.magic == self.magic_sell]
+                grid_info_root = self.active_grids.get(symbol, {})
+                grid_info = grid_info_root.get('SELL', {})
+                
+                # Reset if no active orders or fresh start
+                if not grid_info or (not sell_pendings and not sell_positions):
+                    base_price = current_price
+                    first_idx = 0
+                    last_idx = 0
+                    logger.info(f"🕸️ Resetting SELL Grid for {symbol} at {base_price} (Reason: No active orders)")
+                else:
+                    base_price = grid_info.get('base_price', current_price)
+                    first_idx = grid_info.get('first_index', 0)
+                    last_idx = grid_info.get('last_index', 0)
+
+                # A. ROLLING (Front-end): Follow price moving DOWN
+                # Build SELL limits behind market as it drops
+                while True:
+                    front_price = base_price + ((first_idx + 1) * self.spacing)
+                    if current_price < front_price - (self.spacing * 1.01):
+                        new_idx = first_idx
+                        entry_price = base_price + (new_idx * self.spacing)
+                        # Spread safety
+                        if entry_price <= current_price + (symbol_info.spread * symbol_info.point): break
+                        
+                        res = await self.broker.place_pending_order(symbol, mt5.ORDER_TYPE_SELL_LIMIT, self.lot_size, entry_price, self.magic_sell)
+                        if res['success']:
+                            first_idx -= 1
+                            logger.info(f"🚜 SELL Rolling: Added level at ${entry_price:.3f} (FirstIdx: {first_idx})")
+                        elif res.get('error') == 'MARKET_CLOSED':
+                            break # Silent halt
+                        else:
+                            break # Limit reached or order error
+                    else:
+                        break
+
+                # B. EXPANSION (Back-end): Market moves UP (against positions)
+                if len(sell_pendings) <= self.trigger_threshold and last_idx < self.total_target:
+                    num_to_place = self.batch_size
+                    success_count = 0
+                    start_price = base_price + ((last_idx + 1) * self.spacing)
+                    end_price = start_price
+                    for _ in range(num_to_place):
+                        last_idx += 1
+                        entry_price = base_price + (last_idx * self.spacing)
+                        # Avoid placing right on top of market
+                        if entry_price <= current_price + (symbol_info.spread * symbol_info.point): continue
+                        res = await self.broker.place_pending_order(symbol, mt5.ORDER_TYPE_SELL_LIMIT, self.lot_size, entry_price, self.magic_sell)
+                        if res['success']: 
+                            success_count += 1
+                            end_price = entry_price
+                        elif res.get('error') == 'MARKET_CLOSED':
+                            break # Silent halt
+                    
+                    if success_count > 0:
+                        logger.info(f"🔄 SELL Expansion: {success_count} levels added (${start_price:.2f} to ${end_price:.2f}, LastIdx: {last_idx})")
+
+                # Save state
+                if symbol not in self.active_grids: self.active_grids[symbol] = {}
+                self.active_grids[symbol]['SELL'] = {'base_price': base_price, 'first_index': first_idx, 'last_index': last_idx}
+                self._save_state()
+
+            # 4. Dynamic Grid Logic (BUY Side)
+            if self.mode in ('BUY_ONLY', 'BOTH'):
+                buy_pendings = [o for o in grid_pendings if o.magic == self.magic_buy]
+                grid_info_root = self.active_grids.get(symbol, {})
+                grid_info = grid_info_root.get('BUY', {})
+                
+                if not grid_info or (not buy_pendings and not [p for p in grid_objs if p.magic == self.magic_buy]):
+                    base_price = current_price
+                    first_idx = 0
+                    last_idx = 0
+                    logger.info(f"🕸️ Resetting BUY Grid for {symbol} at {base_price} (Reason: No active orders)")
+                else:
+                    base_price = grid_info.get('base_price', current_price)
+                    first_idx = grid_info.get('first_index', 0)
+                    last_idx = grid_info.get('last_index', 0)
+
+                # A. ROLLING (Front-end): Follow price moving UP
+                # Build BUY limits behind market as it rises
+                while True:
+                    front_price = base_price - ((first_idx + 1) * self.spacing)
+                    if current_price > front_price + (self.spacing * 1.01):
+                        new_idx = first_idx
+                        entry_price = base_price - (new_idx * self.spacing)
+                        # Spread safety
+                        if entry_price >= current_price - (symbol_info.spread * symbol_info.point): break
+                        
+                        res = await self.broker.place_pending_order(symbol, mt5.ORDER_TYPE_BUY_LIMIT, self.lot_size, entry_price, self.magic_buy)
+                        if res['success']:
+                            first_idx -= 1
+                            logger.info(f"🚜 BUY Rolling: Added level at ${entry_price:.3f} (FirstIdx: {first_idx})")
+                        elif res.get('error') == 'MARKET_CLOSED':
+                            break
+                        else:
+                            break
+                    else:
+                        break
+
+                # B. EXPANSION (Back-end): Market moves DOWN (against positions)
+                if len(buy_pendings) <= self.trigger_threshold and last_idx < self.total_target:
+                    num_to_place = self.batch_size
+                    success_count = 0
+                    start_price = base_price - ((last_idx + 1) * self.spacing)
+                    end_price = start_price
+                    for _ in range(num_to_place):
+                        last_idx += 1
+                        entry_price = base_price - (last_idx * self.spacing)
+                        if entry_price >= current_price - (symbol_info.spread * symbol_info.point): continue
+                        res = await self.broker.place_pending_order(symbol, mt5.ORDER_TYPE_BUY_LIMIT, self.lot_size, entry_price, self.magic_buy)
+                        if res['success']: 
+                            success_count += 1
+                            end_price = entry_price
+                        elif res.get('error') == 'MARKET_CLOSED':
+                            break
+                    
+                    if success_count > 0:
+                        logger.info(f"🔄 BUY Expansion: {success_count} levels added (${start_price:.2f} to ${end_price:.2f}, LastIdx: {last_idx})")
+
+                # Save state
+                if symbol not in self.active_grids: self.active_grids[symbol] = {}
+                self.active_grids[symbol]['BUY'] = {'base_price': base_price, 'first_index': first_idx, 'last_index': last_idx}
+                self._save_state()
+
+        except Exception as e:
+            logger.error(f"Error in grid update: {e}")
+
 class LiveTradingSystem:
     """Main Live Trading System"""
     
@@ -714,15 +852,25 @@ class LiveTradingSystem:
         self.ai_brain = TradingBrain()
         self.ict_analyzer = ICTAnalyzer()
         self.risk_manager = RiskManager(self.config.get('risk', {}))
+        self.grid_manager = GridManager(self.broker, self.config)
+        self.grid_recycler = GridRecycler(self.broker, self.config)
         
         self.running = False
-        self.symbols = self.config.get('symbols', ['EURUSDm', 'GBPUSDm', 'XAUUSDm'])
+        self.symbols = self.config.get('symbols', ['XAUUSDm'])
         self.timeframe = self.config.get('timeframe', 'M5')
+        self.strategy = "ICT SMC" # Default strategy
+        self.profit_pct = 0.01 # Default 1%
+        self.profit_usd = self.config.get('grid', {}).get('profit_target_usd', 20)
+        self.trailing_enabled = False
         
         # Performance tracking
         self.trades_today = 0
         self.daily_pnl = 0.0
         self.start_balance = 0.0
+        self.trade_history = []
+        self.reports_dir = Path("logs/live_reports")
+        self.reports_dir.mkdir(parents=True, exist_ok=True)
+        self.market_closed_logged = set() # Track symbols logged for market closure
         
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration"""
@@ -757,14 +905,21 @@ class LiveTradingSystem:
             
             # Connect to broker
             if not await self.broker.connect():
-                logger.error("Failed to connect to MT5")
-                return False
+                logger.warning("📡 MT5 not connected during startup. Watchdog will handle reconnection.")
             
-            # Get account info
+            # Get account info (If connected)
             account_info = mt5.account_info()
             if account_info:
                 self.start_balance = account_info.balance
                 logger.info(f"Account Balance: ${self.start_balance:.2f}")
+            
+            # Cleanup removed: User handles this manually via Choice 6
+            try:
+                import subprocess
+                subprocess.Popen([sys.executable, "live_dashboard.py"], creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0)
+                logger.info("🚀 Live Dashboard auto-opened.")
+            except Exception as e:
+                logger.warning(f"Failed to auto-open dashboard: {e}")
             
             logger.info("✅ System initialized successfully")
             return True
@@ -776,24 +931,78 @@ class LiveTradingSystem:
     async def analyze_and_trade(self, symbol: str):
         """Analyze market and execute trades for a symbol"""
         try:
-            # Get market data (more bars for M5 timeframe)
+            # Get account context
+            acc = mt5.account_info()
+            if not acc: return
+            balance = acc.balance
+
+            # 0. Market Status Check (Halt if closed/disabled or feed frozen)
+            sym_info = mt5.symbol_info(symbol)
+            tick = mt5.symbol_info_tick(symbol)
+            
+            is_closed = False
+            if sym_info and sym_info.trade_mode in [mt5.SYMBOL_TRADE_MODE_DISABLED, mt5.SYMBOL_TRADE_MODE_CLOSEONLY]:
+                is_closed = True
+            
+            # Additional Check: Frozen Feed (e.g. Session breaks where trade_mode stays FULL)
+            if not is_closed and tick:
+                from datetime import datetime
+                tick_time = datetime.fromtimestamp(tick.time)
+                now = datetime.now()
+                # If no tick for more than 60 seconds during M1 trading, it's likely a session break
+                if (now - tick_time).total_seconds() > 60:
+                    is_closed = True
+
+            if is_closed:
+                if symbol not in self.market_closed_logged:
+                    logger.warning(f"⏸️ Market for {symbol} is CLOSED (or Feed Frozen). Pausing operations.")
+                    self.market_closed_logged.add(symbol)
+                return
+            elif symbol in self.market_closed_logged:
+                logger.info(f"▶️ Market for {symbol} has REOPENED. Resuming operations.")
+                self.market_closed_logged.remove(symbol)
+
+            # Get market data
             data = self.broker.get_market_data(symbol, self.timeframe, 500)
             if data.empty:
                 return
             
-            # AI Analysis
+            # AI Analysis (Keep for bias detection)
             ai_analysis = self.ai_brain.analyze_market(symbol, data)
+            current_price = data['close'].iloc[-1]
+            bias = ai_analysis.get('bias', 'NEUTRAL')
             
-            # ICT Analysis
-            structure = self.ict_analyzer.analyze_market_structure(data)
-            order_blocks = self.ict_analyzer.detect_order_blocks(data)
+            # 1. Grid Strategy Logic (Smart Trailing / Standard Grid)
+            if ("Grid" in self.strategy or "Smart" in self.strategy) and "Recycler" not in self.strategy:
+                # Set mode and name
+                self.grid_manager.strategy_name = self.strategy
+                if "BUY ONLY" in self.strategy.upper():
+                    self.grid_manager.mode = "BUY_ONLY"
+                elif "SELL ONLY" in self.strategy.upper():
+                    self.grid_manager.mode = "SELL_ONLY"
+                else:
+                    self.grid_manager.mode = "BOTH"
+                
+                self.grid_manager.profit_threshold_pct = self.profit_pct
+                self.grid_manager.profit_target_usd = self.profit_usd
+                self.grid_manager.trailing_enabled = self.trailing_enabled
+                await self.grid_manager.update(symbol, current_price, bias, balance)
             
-            # Check if we should trade
-            if ai_analysis['confidence'] < self.ai_brain.confidence_threshold:
-                return
+            # 2. Grid Recycler Strategy Logic
+            elif "Recycler" in self.strategy:
+                if "BUY ONLY" in self.strategy.upper():
+                    self.grid_recycler.mode = "BUY_ONLY"
+                elif "SELL ONLY" in self.strategy.upper():
+                    self.grid_recycler.mode = "SELL_ONLY"
+                else:
+                    self.grid_recycler.mode = "BOTH"
+                await self.grid_recycler.update(symbol, current_price)
             
-            if ai_analysis['action'] in ['BUY', 'SELL']:
-                await self._execute_trade(symbol, ai_analysis, structure)
+            # 2. ICT SMC Strategy Logic
+            elif self.strategy == "ICT SMC":
+                if ai_analysis['action'] in ['BUY', 'SELL'] and ai_analysis['confidence'] >= 0.70:
+                    logger.info(f"🎯 ICT Signal Detected: {ai_analysis['action']} {symbol} (Confidence: {ai_analysis['confidence']:.2f})")
+                    await self._execute_trade(symbol, ai_analysis, {})
                 
         except Exception as e:
             logger.error(f"Analysis error for {symbol}: {e}")
@@ -872,16 +1081,31 @@ class LiveTradingSystem:
             account_info = mt5.account_info()
             if account_info:
                 current_balance = account_info.balance
+                
+                # Safety check for start_balance
+                if self.start_balance <= 0 or self.start_balance > 1000000: # Sanity check
+                    self.start_balance = current_balance
+                
                 daily_change = current_balance - self.start_balance
                 
                 print(f"\n{'='*50}")
                 print(f"🧠 NEXT LEVEL BRAIN - LIVE TRADING STATUS")
                 print(f"{'='*50}")
                 print(f"💰 Balance: ${current_balance:.2f}")
-                print(f"📈 Daily P&L: ${daily_change:.2f}")
+                print(f"📈 Daily P&L: ${daily_change:.2f} (Start: ${self.start_balance:.2f})")
                 print(f"📊 Trades Today: {self.trades_today}")
+                
+                # Show Individual Trailing Status (Summary)
+                ticket_states = self.grid_manager.profit_ctrl.ticket_states
+                if ticket_states:
+                    active_locks = [s['lock'] for s in ticket_states.values() if s['lock'] > 0]
+                    if active_locks:
+                        max_lock = max(active_locks)
+                        print(f"🛡️  PROTECTION: {len(active_locks)} Trades Trailing (Max Lock: ${max_lock:.1f})")
+
                 print(f"🎯 AI Memories: {len(self.ai_brain.memories)}")
                 print(f"⏰ Last Update: {datetime.now().strftime('%H:%M:%S')}")
+                print(f"📂 Reports Path: {self.reports_dir.absolute()}")
                 
                 positions = self.broker.get_positions()
                 if positions:
@@ -896,40 +1120,114 @@ class LiveTradingSystem:
             logger.error(f"Status display error: {e}")
     
     async def run(self):
-        """Main trading loop"""
+        """Main trading loop with Auto-Reconnect Watchdog"""
         try:
             if not await self.initialize():
                 return
             
             self.running = True
+            try:
+                # Sync Equity Milestone Baseline on Startup
+                acc = mt5.account_info()
+                if acc:
+                    ctrl = self.grid_manager.profit_ctrl
+                    stored_baseline = ctrl.equity_milestone_state.get('baseline_equity', 0)
+                    # If no baseline or baseline is significantly HIGHER than current (meaning we had a loss)
+                    # Auto-sync it so the $100 target starts from current reality
+                    if stored_baseline <= 0 or acc.equity < (stored_baseline - 10):
+                        logger.info(f"🔄 Auto-Syncing Equity Baseline to current equity: ${acc.equity:.2f}")
+                        ctrl.reset_equity_milestone(acc.equity)
+            except Exception as e:
+                logger.error(f"Error during equity baseline sync: {e}")
+
             logger.info("🚀 Starting live trading...")
             
             cycle_count = 0
             
             while self.running:
                 try:
+                    # Connection Watchdog (Heartbeat)
+                    if not await self.broker.is_connected():
+                        logger.warning("📡 Connection unstable or lost. Waiting for Internet/MT5...")
+                        if await self.broker.connect():
+                            logger.info("✅ System synchronized. Connection restored!")
+                        else:
+                            await asyncio.sleep(10) # Wait and retry
+                            continue
+
                     cycle_count += 1
+                    acc = mt5.account_info()
+
+                    # 2. GLOBAL RESET WATCHDOG (Dashboard Signal)
+                    reset_signal = Path("logs/global_reset.signal")
+                    if reset_signal.exists():
+                        logger.warning("🛑 GLOBAL RESET SIGNAL DETECTED! Performing full wipe...")
+                        await self._close_all_universe()
+                        self.grid_manager.profit_ctrl.reset() # Clears all peaks, locks, and milestones
+                        try:
+                            reset_signal.unlink() # Delete signal
+                            logger.success("✅ Global Reset Complete. System Clean.")
+                        except Exception as e:
+                            logger.error(f"Failed to delete reset signal: {e}")
+                        
+                        # Refresh account info after closure
+                        acc = mt5.account_info()
+
+                    # Silent Waiting Mode: If all symbols are closed, skip status and slow down
+                    all_closed = all(s in self.market_closed_logged for s in self.symbols)
                     
-                    # Display status every 10 cycles
-                    if cycle_count % 10 == 0:
+                    # Display status every 30 seconds (300 cycles @ 0.1s) - Skip if silent
+                    if not all_closed and cycle_count % 300 == 0:
                         self.display_status()
                     
+                    # 3. Grand Basket Trailing (Universe-Wide)
+                    # Monitor ALL active positions across ALL symbols/strategies
+                    all_positions = self.broker.get_positions()
+                    if await self.grid_manager.profit_ctrl.monitor_grand_basket(all_positions, trigger_usd=5.0):
+                        print(f"\n{'!'*50}")
+                        print(f"🏁 GRAND BASKET TRAILING EXIT TRIGGERED!")
+                        print(f"💰 Closing all trades to secure profit...")
+                        print(f"{'!'*50}\n")
+                        logger.warning("🏁 GRAND BASKET TRAILING EXIT TRIGGERED! Closing everything.")
+                        await self._close_all_universe()
+                        # Reset Layer 3 baseline after Layer 2 exit
+                        if acc: self.grid_manager.profit_ctrl.reset_equity_milestone(acc.equity)
+
+                    # 4. LAYER 3: Equity Milestone Monitor ($100 Target)
+                    if acc:
+                        if await self.grid_manager.profit_ctrl.monitor_equity_milestone(acc.equity, target_increase=100.0):
+                            print(f"\n{'#'*50}")
+                            print(f"🏆 EQUITY MILESTONE HIT (+$100)!")
+                            print(f"💰 Securing account-level profit...")
+                            print(f"{'#'*50}\n")
+                            logger.success("🏆 EQUITY MILESTONE HIT! Closing Universe.")
+                            await self._close_all_universe()
+                            self.grid_manager.profit_ctrl.reset_equity_milestone(acc.equity)
+
                     # Analyze each symbol
                     for symbol in self.symbols:
                         await self.analyze_and_trade(symbol)
-                        await asyncio.sleep(1)  # Small delay between symbols
+                        await asyncio.sleep(0.01)  # Minimal delay between symbols
                     
-                    # Monitor positions
-                    await self.monitor_positions()
+                    # Update session history (Every ~10 seconds) - Skip if silent
+                    if not all_closed and cycle_count % 100 == 0:
+                        self._update_session_history()
                     
                     # Wait before next cycle
-                    await asyncio.sleep(30)  # 30 second cycle
+                    if all_closed:
+                        delay = 2.0 # Slow heartbeat when closed
+                    else:
+                        # ULTRA SPEED for Grid/Smart strategies
+                        delay = 0.1 if ("Grid" in self.strategy or "Smart" in self.strategy or "Recycler" in self.strategy) else 5
+                    
+                    await asyncio.sleep(delay)
                     
                 except KeyboardInterrupt:
                     logger.info("Shutdown signal received")
                     break
                 except Exception as e:
                     logger.error(f"Trading loop error: {e}")
+                    # If it's a network error, MT5 calls might fail
                     await asyncio.sleep(5)
             
         except Exception as e:
@@ -937,62 +1235,293 @@ class LiveTradingSystem:
         finally:
             await self.shutdown()
     
+    async def _close_all_universe(self):
+        """Emergency Close: Wipe all positions and pendings across all symbols"""
+        try:
+            positions = self.broker.get_positions()
+            for pos in positions:
+                await self.broker.close_position(pos['ticket'])
+            
+            # Cancel all pendings for our symbols
+            for symbol in self.symbols:
+                await self.broker.cancel_all_pendings(symbol)
+            
+            logger.info("✅ Universe cleanup completed.")
+        except Exception as e:
+            logger.error(f"Error during universe cleanup: {e}")
+    
     async def shutdown(self):
         """Shutdown the trading system"""
         try:
             self.running = False
             logger.info("🛑 Shutting down trading system...")
             
+            # Generate final report before closing
+            self._update_session_history()
+            report_file = self.generate_session_report()
+            if report_file:
+                logger.info(f"📄 Final Session Report saved: {report_file}")
+            
             # Close MT5 connection
             mt5.shutdown()
             
             logger.info("✅ Shutdown completed")
-            
         except Exception as e:
             logger.error(f"Shutdown error: {e}")
 
-def select_trading_mode():
-    """Select trading mode (CLI)"""
+    def _update_session_history(self):
+        """Fetch closed deals from MT5 for the last 30 days to build performance metrics"""
+        try:
+            # Fetch last 30 days for comprehensive performance tracking
+            from_date = datetime.now() - timedelta(days=30)
+            to_date = datetime.now() + timedelta(days=1)
+            
+            deals = mt5.history_deals_get(from_date, to_date)
+            if not deals:
+                return
+
+            new_history = []
+            for d in deals:
+                if d.entry == 1: # DEAL_ENTRY_OUT
+                    new_history.append({
+                        'ticket': d.ticket,
+                        'symbol': d.symbol,
+                        'type': 'BUY' if d.type == mt5.DEAL_TYPE_BUY else 'SELL',
+                        'volume': d.volume,
+                        'price': d.price,
+                        'profit': d.profit + d.commission + d.swap,
+                        'magic': d.magic,
+                        'time': datetime.fromtimestamp(d.time).strftime('%Y-%m-%d %H:%M:%S'),
+                        'comment': d.comment
+                    })
+            
+            self.trade_history = new_history
+            # Today's specific metrics for display
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            today_trades = [t for t in self.trade_history if today_str in t['time']]
+            self.daily_pnl = sum(t['profit'] for t in today_trades)
+            self.trades_today = len(today_trades)
+            
+        except Exception as e:
+            logger.error(f"Failed to update history: {e}")
+
+    def generate_session_report(self) -> Optional[str]:
+        """Generate a detailed markdown report with Backtest-style metrics"""
+        try:
+            if not self.trade_history:
+                return None
+            
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            report_file = self.reports_dir / f"live_performance_{timestamp}.md"
+            
+            # Advanced metrics calculation
+            profits = [t['profit'] for t in self.trade_history]
+            wins = [p for p in profits if p > 0]
+            losses = [p for p in profits if p <= 0]
+            
+            win_rate = (len(wins) / len(profits) * 100) if profits else 0
+            gross_profit = sum(wins)
+            gross_loss = abs(sum(losses))
+            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+            
+            # Drawdown calculation
+            acc_info = mt5.account_info()
+            base_balance = acc_info.balance if acc_info else 10000.0
+            cum_pnl = np.cumsum(profits)
+            equity_curve = base_balance + cum_pnl
+            peak = np.maximum.accumulate(equity_curve)
+            drawdown_pct = (peak - equity_curve) / peak * 100
+            max_dd_pct = np.max(drawdown_pct) if len(drawdown_pct) > 0 else 0
+            
+            report = [
+                "# 🧠 NEXT LEVEL BRAIN - LIVE PERFORMANCE REPORT",
+                f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"**Tracking Period:** Last 30 Days",
+                f"**Strategy:** {self.strategy}",
+                "\n## 📊 PERFORMANCE SUMMARY (Backtest Style)",
+                f"- **Total Trades:** {len(profits)}",
+                f"- **Win Rate:** {win_rate:.1f}%",
+                f"- **Total P&L:** ${sum(profits):.2f}",
+                f"- **Profit Factor:** {profit_factor:.2f}",
+                f"- **Max Drawdown:** {max_dd_pct:.2f}%",
+                f"- **Avg Win:** ${ (sum(wins)/len(wins)) if wins else 0 :.2f}",
+                f"- **Avg Loss:** ${ (sum(losses)/len(losses)) if losses else 0 :.2f}",
+                "\n## 📋 RECENT TRADE LOG (Last 50)",
+                "| Time | Symbol | Side | Lots | Profit ($) | Comment |",
+                "|------|--------|------|------|------------|---------|"
+            ]
+            
+            for t in sorted(self.trade_history, key=lambda x: x['time'], reverse=True)[:50]:
+                report.append(f"| {t['time']} | {t['symbol']} | {t['type']} | {t['volume']} | {t['profit']:.2f} | {t['comment']} |")
+            
+            with open(report_file, 'w', encoding='utf-8') as f:
+                f.write("\n".join(report))
+            
+            return str(report_file)
+            
+        except Exception as e:
+            logger.error(f"Failed to generate report: {e}")
+            return None
+
+def select_trade_setup():
+    """Simplified setup selection as requested"""
     print("\n" + "="*60)
-    print("🧠 NEXT LEVEL BRAIN - LIVE TRADING SYSTEM (CLI)")
-    print("Created by: Aleem Shahzad | AI Partner: Claude (Anthropic)")
-    print("="*60)
-    print("Select trading mode:")
-    print("1. 🎯 Single Symbol Trading")
-    print("2. 🌍 Multi-Symbol Trading")
-    print("3. ❌ Exit")
+    print("🚀 NEXT LEVEL BRAIN - QUICK LAUNCH (GOLD ONLY)")
     print("="*60)
     
+    # 1. Strategy/Direction
+    print("\n🎯 SELECT DIRECTION / ACTION:")
+    print("1. 🛡️ SMART TRAILING BUY ONLY ($10/$20)")
+    print("2. 🛡️ SMART TRAILING SELL ONLY ($10/$20)")
+    print("3. 🧠 ICT SMC (Trend Following)")
+    print("4. 📊 OPEN LIVE DASHBOARD (Visual Tracker)")
+    print("5. 🧹 DELETE ALL PENDING ORDERS")
+    print("6. 📈 OPEN BACKTESTING (Strategy Tester)")
+    
+    strategy = "Grid Both"
+    trailing_enabled = False
+    recycler_mode = False
+    recycler_profit_usd = 1.0  # default per-trade profit target
+    while True:
+        choice = input("Choice (1-6): ").strip()
+        if choice == "1":
+            strategy = "Smart Trailing BUY ONLY"
+            trailing_enabled = True
+            break
+        if choice == "2":
+            strategy = "Smart Trailing SELL ONLY"
+            trailing_enabled = True
+            break
+        if choice == "3": strategy = "ICT SMC"; break
+        if choice == "4":
+            print("🚀 Opening Live Dashboard...")
+            import subprocess
+            subprocess.Popen([sys.executable, "live_dashboard.py"], creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0)
+            print("✅ Dashboard launched. Continuing...")
+            continue
+        if choice == "5":
+            print("🧹 Cleaning up all Gold pending orders...")
+            if mt5.initialize():
+                # Rapid cleanup
+                for s in ["XAUUSDm", "XAUUSD"]:
+                    orders = mt5.orders_get(symbol=s)
+                    if orders:
+                        for o in orders:
+                            mt5.order_send({"action": mt5.TRADE_ACTION_REMOVE, "order": o.ticket})
+                print("✅ All pending orders deleted.")
+            else:
+                print("❌ Failed to connect to MT5 for cleanup.")
+            continue
+        if choice == "6":
+            print("🚀 Opening Backtesting System...")
+            import subprocess
+            subprocess.Popen([sys.executable, "backtesting.py"], creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0)
+            print("✅ Backtesting launched.")
+            continue
+        print("Invalid choice.")
+
+    # 1b. Per-Trade Target is now trailing-based (Default $1.0)
+    if recycler_mode:
+        recycler_profit_usd = 1.0
+        print(f"✅ Recycler: Trailing Profit Activated (Base: ${recycler_profit_usd:.2f})")
+
+
+    # 2. Profit Target
+    profit_pct = 0.01
+    profit_usd = 0
+    if recycler_mode:
+        # For Recycler, we skip standard targets as it uses per-trade targets
+        pass
+    elif trailing_enabled:
+        print(f"\n🛡️  PROTECTION: Using {strategy} ($10/$20 Tracking)")
+    else:
+        print("\n💰 SELECT PROFIT TARGET:")
+        print("A. Enter Target % (1 to 20):")
+        while True:
+            try:
+                val = input("Target % (1-20) [Default 1]: ").strip()
+                if not val:
+                    profit_pct = 0.01
+                    break
+                f_val = float(val)
+                if 1 <= f_val <= 20:
+                    profit_pct = f_val / 100.0
+                    break
+            except: pass
+            print("Invalid choice. Please enter a number between 1 and 20.")
+
+        print("\nB. Or Enter Target USD ($):")
+        while True:
+            try:
+                val = input("Target USD (e.g. 10, 20) [Enter 'T' for Smart Trailing 10-20]: ").strip().upper()
+                if val == 'T':
+                    profit_usd = 0
+                    trailing_enabled = True
+                    # Set strategy name based on implied mode if not already set specifically
+                    if strategy == "Grid Both": strategy = "Smart Trailing Both"
+                    elif strategy == "Grid BUY ONLY": strategy = "Smart Trailing BUY ONLY"
+                    elif strategy == "Grid SELL ONLY": strategy = "Smart Trailing SELL ONLY"
+                    else: strategy = "SMART TRAILING 10-20"
+                    
+                    print(f"✅ Smart Trailing Activated for {strategy}")
+                    break
+                
+                trailing_enabled = False
+                if not val:
+                    profit_usd = 0 
+                    break
+                f_val = float(val)
+                if f_val > 0:
+                    profit_usd = f_val
+                    break
+            except: pass
+            print("Invalid choice. Please enter a positive number or 'T'.")
+
+    # 3. Timeframe
+    print("\n⏰ SELECT TIMEFRAME:")
+    tfs = ["M1", "M3", "M5", "M15", "M30", "H1", "H4", "D1"]
+    for i, tf in enumerate(tfs, 1):
+        print(f"{i}. {tf}")
+    
+    timeframe = "M1"
     while True:
         try:
-            choice = input("Enter your choice (1-3): ").strip()
-            
-            if choice == "1":
-                symbols = {
-                    1: "EURUSDm", 2: "GBPUSDm", 3: "USDJPYm",
-                    4: "XAUUSDm", 5: "XAGUSDm", 6: "BTCUSDm", 7: "ETHUSDm"
-                }
-                
-                print("\nSelect symbol:")
-                for num, symbol in symbols.items():
-                    print(f"  {num}. {symbol}")
-                
-                symbol_choice = int(input("Enter symbol choice: "))
-                if symbol_choice in symbols:
-                    return [symbols[symbol_choice]]
-                    
-            elif choice == "2":
-                return ['EURUSDm', 'GBPUSDm', 'XAUUSDm', 'BTCUSDm']
-                
-            elif choice == "3":
-                return None
-                
-            else:
-                print("Invalid choice. Please try again.")
-                
-        except (ValueError, KeyboardInterrupt):
-            print("Invalid input or cancelled.")
-            return None
+            choice = int(input(f"Choice (1-{len(tfs)}): ").strip())
+            if 1 <= choice <= len(tfs):
+                timeframe = tfs[choice-1]
+                break
+        except: pass
+        print("Invalid choice.")
+
+    # 4. Lot Size Selection (0.01 to 0.10)
+    print("\n📦 SELECT LOT SIZE (0.01 - 0.10):")
+    lot_size = 0.01
+    while True:
+        try:
+            val = input("Enter Lot Size (e.g. 0.01, 0.05, 0.10) [Default 0.01]: ").strip()
+            if not val:
+                lot_size = 0.01
+                break
+            f_val = float(val)
+            if 0.01 <= f_val <= 0.10:
+                lot_size = f_val
+                # Update config.yaml
+                try:
+                    with open('config.yaml', 'r') as f:
+                        config = yaml.safe_load(f) or {}
+                    if 'grid' not in config: config['grid'] = {}
+                    config['grid']['lot_size'] = lot_size
+                    with open('config.yaml', 'w') as f:
+                        yaml.dump(config, f)
+                    logger.info(f"📝 config.yaml updated: lot_size = {lot_size}")
+                except Exception as e:
+                    logger.error(f"Failed to update config.yaml: {e}")
+                break
+        except: pass
+        print("Invalid choice. Please enter a value between 0.01 and 0.10.")
+
+    return ["XAUUSDm"], strategy, timeframe, profit_pct, profit_usd, trailing_enabled, recycler_profit_usd, lot_size
+
 
 def main():
     """Main function - CLI mode"""
@@ -1002,17 +1531,41 @@ def main():
         Path("charts").mkdir(exist_ok=True)
         Path("models").mkdir(exist_ok=True)
         
-        print("🚀 Launching NEXT LEVEL BRAIN Live Trading (CLI mode)...")
-        symbols = select_trading_mode()
-        if symbols is None:
+        symbols, strategy, timeframe, profit_pct, profit_usd, trailing_enabled, recycler_profit_usd, lot_size = select_trade_setup()
+        if symbols is None or strategy is None or timeframe is None:
             print("Exiting.")
             return
         
         trading_system = LiveTradingSystem()
         trading_system.symbols = symbols
+        trading_system.strategy = strategy
+        trading_system.timeframe = timeframe
+        trading_system.profit_pct = profit_pct
+        trading_system.trailing_enabled = trailing_enabled
+        
+        # Propagate lot size and profit targets to ALL components
+        trading_system.grid_manager.lot_size = lot_size
+        trading_system.grid_manager.per_trade_profit = recycler_profit_usd
+        
+        trading_system.grid_recycler.lot_size = lot_size
+        trading_system.grid_recycler.per_trade_profit = recycler_profit_usd
+        if profit_usd > 0:
+            trading_system.profit_usd = profit_usd
         
         # Run trading loop
         asyncio.run(trading_system.run())
+        
+        # After trading loop, offer to open backtesting
+        print("\n" + "="*50)
+        print("🏁 SESSION ENDED")
+        print("="*50)
+        bt_choice = input("Open Backtesting System? (Y/N): ").strip().upper()
+        if bt_choice == 'Y':
+            import subprocess
+            subprocess.Popen([sys.executable, "backtesting.py"], creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == 'nt' else 0)
+            print("✅ Backtesting launched. Goodbye!")
+        else:
+            print("Goodbye!")
         
     except KeyboardInterrupt:
         logger.info("Application interrupted by user")
